@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[env]
+CUDARC_CUDA_VERSION = "12080"
