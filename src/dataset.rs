@@ -21,13 +21,13 @@ impl<B: Backend> Batcher<B, ImagePair, ImageBatch<B>> for ImageBatcher {
             .map(|item| {
                 let mut e = Tensor::<B, 3>::from_data(
                     TensorData::new(item.edited, [h, w, CHANNELS]).convert::<B::FloatElem>(),
-                    &device,
+                    device,
                 )
                 .permute([2, 0, 1]);
 
                 let mut o = Tensor::<B, 3>::from_data(
                     TensorData::new(item.original, [h, w, CHANNELS]).convert::<B::FloatElem>(),
-                    &device,
+                    device,
                 )
                 .permute([2, 0, 1]);
 

@@ -18,7 +18,6 @@ const OUTPUT_DIR: &str = "edited";
 const PIXEL_MAX: f32 = 255.0;
 const PIXEL_MID: f32 = PIXEL_MAX / 2.0;
 const TARGET_WHITE: f32 = 253.0;
-const LUMA_THRESHOLD: f32 = 0.12;
 
 fn norm(data: &[u8]) -> Vec<f32> {
     data.iter().map(|&b| (b as f32 / PIXEL_MID) - 1.0).collect()
@@ -44,17 +43,17 @@ pub fn files_init() -> Vec<ImagePair> {
 
         for p in luma.pixels_mut() {
             let l = p[0] as f32 / PIXEL_MAX;
-            let effect = if l < LUMA_THRESHOLD {
-                0.6
+            let effect = if l < 0.12 {
+                2.0
             } else {
-                (l * 2.5).powf(1.1).max(1.0)
+                (l * 4.0).powf(1.1).max(1.0)
             };
             p[0] = (l * effect * TARGET_WHITE).min(TARGET_WHITE) as u8;
         }
 
         let final_img = DynamicImage::ImageLuma8(luma)
-            .blur(0.5)
-            .adjust_contrast(50.0);
+            .blur(0.8)
+            .adjust_contrast(5.0);
         final_img
             .save(Path::new(OUTPUT_DIR).join(path.file_name().unwrap()))
             .unwrap();

@@ -21,7 +21,7 @@ pub struct TrainingConfig {
     pub optimizer: RmsPropConfig,
     #[config(default = 500)]
     pub num_epochs: usize,
-    #[config(default = 4)]
+    #[config(default = 8)]
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
@@ -91,7 +91,6 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
     let optimizer_config = RmsPropConfig::new()
         .with_alpha(0.99)
-        .with_epsilon(1e-8)
         .with_weight_decay(None);
 
     let config = TrainingConfig::new(NetworkConfig::new(), optimizer_config);
@@ -114,61 +113,55 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     let dataloader_train = DataLoaderBuilder::new(batcher)
         .batch_size(config.batch_size)
         .shuffle(config.seed)
-        .num_workers(1)
+        .num_workers(5)
         .build(dataset);
 
     for epoch in 0..config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
-            let fake_images = generator.forward(batch.edited.clone()).detach();
-            let score_fake = discriminator.forward(fake_images);
-            let score_real = discriminator.forward(batch.original.clone());
-            let loss_d = score_fake.mean() - score_real.mean();
+            let edited = batch.edited.detach();
+            let original = batch.original.detach();
 
-            let d_loss_scalar = loss_d.clone().into_scalar();
+            let fake_images = generator.forward(edited.clone()).detach();
+            for i in 0..config.num_critic {
+                let score_fake = discriminator.forward(fake_images.clone());
+                let score_real = discriminator.forward(original.clone());
 
-            let grads = loss_d.backward();
-            let grads = GradientsParams::from_grads(grads, &discriminator);
-            discriminator = optimizer_d.step(config.lr, discriminator, grads);
-            discriminator = discriminator.map(&mut clip);
+                let loss_d = score_fake.mean() - score_real.mean();
 
-            if iteration % config.num_critic == 0 {
-                let reconstructed = generator.forward(batch.edited.clone());
-                let score_recon = discriminator.forward(reconstructed.clone());
-                let loss_adv = -score_recon.mean();
-                let loss_l1 = (reconstructed.clone() - batch.original.clone())
-                    .abs()
-                    .mean();
+                if i == 0 && iteration % 10 == 0 {
+                    println!("Loss D: {}", loss_d.clone().into_scalar().to_f32());
+                }
 
-                let loss_g = loss_adv.clone() + (loss_l1.clone() * 100.0);
+                {
+                    let grads = loss_d.backward();
+                    let grads = GradientsParams::from_grads(grads, &discriminator);
+                    discriminator = optimizer_d.step(config.lr, discriminator, grads);
+                }
 
-                let g_loss_scalar = loss_g.clone().into_scalar();
+                discriminator = discriminator.map(&mut clip);
+            }
 
+            let reconstructed = generator.forward(edited.clone());
+            let score_recon = discriminator.forward(reconstructed.clone());
+
+            let loss_adv = -score_recon.mean();
+            let loss_l1 = (reconstructed.clone() - original.clone()).abs().mean();
+
+            let loss_g = loss_adv + (loss_l1 * 100.0);
+
+            {
                 let grads = loss_g.backward();
                 let grads = GradientsParams::from_grads(grads, &generator);
                 generator = optimizer_g.step(config.lr, generator, grads);
+            }
 
-                let batch_num = (dataloader_train.num_items() as f32 / config.batch_size as f32)
-                    .ceil() as usize;
+            if iteration % 10 == 0 {
+                println!("Loss G: {}", loss_g.clone().into_scalar().to_f32());
+                println!("Epoch: {}", epoch);
+            }
 
-                if iteration % 100 == 0 {
-                    save_samples(
-                        epoch,
-                        iteration,
-                        batch.edited.clone(),
-                        batch.original.clone(),
-                        reconstructed.clone(),
-                    );
-                }
-
-                println!(
-                    "[Epoch {}/{}] [Batch {}/{}] [D: {:.4}] [G: {:.4}]",
-                    epoch + 1,
-                    config.num_epochs,
-                    iteration,
-                    batch_num,
-                    d_loss_scalar,
-                    g_loss_scalar
-                );
+            if iteration % 100 == 0 {
+                save_samples(epoch, iteration, edited, original, reconstructed);
             }
         }
     }
