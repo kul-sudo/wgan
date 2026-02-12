@@ -4,12 +4,14 @@ use burn::{
     module::Module,
     nn::{
         GaussianNoise, GaussianNoiseConfig, InstanceNorm, InstanceNormConfig, PaddingConfig2d,
-        conv::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig},
+        conv::{Conv2d, Conv2dConfig},
     },
     tensor::{
         Tensor,
         activation::{leaky_relu, mish, tanh},
         backend::Backend,
+        module::interpolate,
+        ops::{InterpolateMode, InterpolateOptions},
     },
 };
 
@@ -63,23 +65,30 @@ impl<B: Backend> GeneratorConvBlock<B> {
 
 #[derive(Module, Debug)]
 pub struct GeneratorDeconvBlock<B: Backend> {
-    deconv: ConvTranspose2d<B>,
+    conv: Conv2d<B>,
     bn: InstanceNorm<B>,
 }
 
 impl<B: Backend> GeneratorDeconvBlock<B> {
-    pub fn new(in_channels: usize, out_channels: usize, stride: usize, device: &B::Device) -> Self {
-        let deconv = ConvTranspose2dConfig::new([in_channels, out_channels], [4, 4])
-            .with_stride([stride, stride])
-            .with_padding([1, 1])
+    pub fn new(in_channels: usize, out_channels: usize, device: &B::Device) -> Self {
+        let conv = Conv2dConfig::new([in_channels, out_channels], [3, 3])
+            .with_padding(PaddingConfig2d::Explicit(1, 1))
             .init(device);
         let bn = InstanceNormConfig::new(out_channels).init(device);
 
-        Self { deconv, bn }
+        Self { conv, bn }
     }
 
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
-        let x = self.deconv.forward(input);
+        let [_batch, _channels, h, w] = input.dims();
+
+        let x = interpolate(
+            input,
+            [h * 2, w * 2],
+            InterpolateOptions::new(InterpolateMode::Nearest),
+        );
+
+        let x = self.conv.forward(x);
         let x = self.bn.forward(x);
         mish(x)
     }
@@ -90,6 +99,8 @@ pub struct Generator<B: Backend> {
     pub enc1: GeneratorConvBlock<B>,
     pub enc2: GeneratorConvBlock<B>,
     pub enc3: GeneratorConvBlock<B>,
+    pub enc4: GeneratorConvBlock<B>,
+    pub dec4: GeneratorDeconvBlock<B>,
     pub dec1: GeneratorDeconvBlock<B>,
     pub dec2: GeneratorDeconvBlock<B>,
     pub dec3: GeneratorDeconvBlock<B>,
@@ -101,15 +112,18 @@ impl<B: Backend> Generator<B> {
         let s1 = self.enc1.forward(input);
         let s2 = self.enc2.forward(s1.clone());
         let s3 = self.enc3.forward(s2.clone());
+        let s4 = self.enc4.forward(s3.clone());
 
-        let x = self.dec1.forward(s3);
+        let x = self.dec4.forward(s4);
+        let x = Tensor::cat(vec![x, s3], 1);
+
+        let x = self.dec1.forward(x);
         let x = Tensor::cat(vec![x, s2], 1);
 
         let x = self.dec2.forward(x);
         let x = Tensor::cat(vec![x, s1], 1);
 
         let x = self.dec3.forward(x);
-
         let x = self.final_conv.forward(x);
         tanh(x)
     }
@@ -120,27 +134,27 @@ pub struct Discriminator<B: Backend> {
     pub noise: GaussianNoise,
     pub conv1: DiscriminatorBlock<B>,
     pub conv2: DiscriminatorBlock<B>,
+    pub conv3: DiscriminatorBlock<B>,
     pub final_layer: Conv2d<B>,
 }
 
 impl<B: Backend> Discriminator<B> {
-    pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 2> {
+    pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.noise.forward(images);
 
         let x = self.conv1.forward(x);
         let x = self.conv2.forward(x);
+        let x = self.conv3.forward(x);
 
         let x = self.final_layer.forward(x);
 
-        let x = x.mean_dims(&[2, 3]);
-
-        x.flatten(1, 3)
+        x
     }
 }
 
 #[derive(Config, Debug)]
 pub struct NetworkConfig {
-    #[config(default = 64)]
+    #[config(default = 32)]
     pub base_channels: usize,
 }
 
@@ -152,19 +166,22 @@ impl NetworkConfig {
             enc1: GeneratorConvBlock::new(CHANNELS, c, 2, device),
             enc2: GeneratorConvBlock::new(c, c * 2, 2, device),
             enc3: GeneratorConvBlock::new(c * 2, c * 4, 2, device),
-            dec1: GeneratorDeconvBlock::new(c * 4, c * 2, 2, device),
-            dec2: GeneratorDeconvBlock::new(c * 4, c, 2, device),
-            dec3: GeneratorDeconvBlock::new(c * 2, c, 2, device),
+            enc4: GeneratorConvBlock::new(c * 4, c * 8, 2, device),
+            dec4: GeneratorDeconvBlock::new(c * 8, c * 4, device),
+            dec1: GeneratorDeconvBlock::new(c * 8, c * 2, device),
+            dec2: GeneratorDeconvBlock::new(c * 4, c, device),
+            dec3: GeneratorDeconvBlock::new(c * 2, c, device),
             final_conv: Conv2dConfig::new([c, CHANNELS], [3, 3])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .init(device),
         };
 
         let discriminator = Discriminator {
-            noise: GaussianNoiseConfig::new(0.2).init(),
+            noise: GaussianNoiseConfig::new(0.05).init(),
             conv1: DiscriminatorBlock::new(CHANNELS, c, 2, device),
             conv2: DiscriminatorBlock::new(c, c * 2, 2, device),
-            final_layer: Conv2dConfig::new([c * 2, 1], [3, 3])
+            conv3: DiscriminatorBlock::new(c * 2, c * 4, 2, device),
+            final_layer: Conv2dConfig::new([c * 4, 1], [3, 3])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .init(device),
         };

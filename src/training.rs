@@ -8,7 +8,7 @@ use burn::{
     optim::{GradientsParams, Optimizer, RmsPropConfig},
     prelude::*,
     record::CompactRecorder,
-    tensor::backend::AutodiffBackend,
+    tensor::{backend::AutodiffBackend, module::conv2d, ops::ConvOptions},
 };
 use image::{GrayImage, Luma};
 use std::fs::create_dir_all;
@@ -25,7 +25,7 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
-    #[config(default = 5e-4)]
+    #[config(default = 1e-4)]
     pub lr: f64,
     #[config(default = 5)]
     pub num_critic: usize,
@@ -51,6 +51,24 @@ impl<B: AutodiffBackend> ModuleMapper<B> for Clip {
     }
 }
 
+fn sobel<B: Backend>(x: Tensor<B, 4>, device: &B::Device) -> Tensor<B, 4> {
+    let opts = ConvOptions::new([1, 1], [1, 1], [1, 1], 1);
+
+    let gx = Tensor::<B, 4>::from_data(
+        [[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]],
+        device,
+    );
+    let gy = Tensor::<B, 4>::from_data(
+        [[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]],
+        device,
+    );
+
+    let x_edges = conv2d(x.clone(), gx, None, opts.clone());
+    let y_edges = conv2d(x, gy, None, opts);
+
+    (x_edges.powf_scalar(2.0) + y_edges.powf_scalar(2.0) + 1e-8).sqrt()
+}
+
 fn save_samples<B: Backend>(
     epoch: usize,
     iter: usize,
@@ -58,11 +76,23 @@ fn save_samples<B: Backend>(
     original_target: Tensor<B, 4>,
     reconstructed: Tensor<B, 4>,
 ) {
-    let [_, _, h, w] = original_target.dims();
+    let [_batch_size, _channels, h, w] = original_target.dims();
 
-    let input_vec = manual_input.into_data().to_vec::<f32>().unwrap();
-    let target_vec = original_target.into_data().to_vec::<f32>().unwrap();
-    let recon_vec = reconstructed.into_data().to_vec::<f32>().unwrap();
+    let input_vec = manual_input
+        .slice([0..1, 0..1])
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    let target_vec = original_target
+        .slice([0..1, 0..1])
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+    let recon_vec = reconstructed
+        .slice([0..1, 0..1])
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
 
     let mut combined = GrayImage::new(w as u32 * 3, h as u32);
 
@@ -83,7 +113,9 @@ fn save_samples<B: Backend>(
     }
 
     let path = format!("{ARTIFACT_DIR}/comparison_e{}_i{}.png", epoch, iter);
-    combined.save(&path).ok();
+    if let Err(e) = combined.save(&path) {
+        eprintln!("Failed to save sample: {}", e);
+    }
 }
 
 pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
@@ -113,7 +145,7 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     let dataloader_train = DataLoaderBuilder::new(batcher)
         .batch_size(config.batch_size)
         .shuffle(config.seed)
-        .num_workers(5)
+        .num_workers(2)
         .build(dataset);
 
     for epoch in 0..config.num_epochs {
@@ -143,11 +175,18 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
             let reconstructed = generator.forward(edited.clone());
             let score_recon = discriminator.forward(reconstructed.clone());
-
             let loss_adv = -score_recon.mean();
+
             let loss_l1 = (reconstructed.clone() - original.clone()).abs().mean();
 
-            let loss_g = loss_adv + (loss_l1 * 100.0);
+            let edges_recon = sobel(reconstructed.clone(), &device);
+            let edges_orig = sobel(original.clone(), &device).detach();
+            let loss_sobel = (edges_recon - edges_orig).abs().mean();
+
+            const LAMBDA_L1: f32 = 10.0;
+            const LAMBDA_SOBEL: f32 = 120.0;
+
+            let loss_g = loss_adv + (loss_l1 * LAMBDA_L1) + (loss_sobel * LAMBDA_SOBEL);
 
             {
                 let grads = loss_g.backward();
