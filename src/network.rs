@@ -118,10 +118,8 @@ impl<B: Backend> Generator<B> {
         let x = Tensor::cat(vec![x, s3], 1);
 
         let x = self.dec1.forward(x);
-        let x = Tensor::cat(vec![x, s2], 1);
 
         let x = self.dec2.forward(x);
-        let x = Tensor::cat(vec![x, s1], 1);
 
         let x = self.dec3.forward(x);
         let x = self.final_conv.forward(x);
@@ -146,9 +144,7 @@ impl<B: Backend> Discriminator<B> {
         let x = self.conv2.forward(x);
         let x = self.conv3.forward(x);
 
-        let x = self.final_layer.forward(x);
-
-        x
+        self.final_layer.forward(x)
     }
 }
 
@@ -169,8 +165,8 @@ impl NetworkConfig {
             enc4: GeneratorConvBlock::new(c * 4, c * 8, 2, device),
             dec4: GeneratorDeconvBlock::new(c * 8, c * 4, device),
             dec1: GeneratorDeconvBlock::new(c * 8, c * 2, device),
-            dec2: GeneratorDeconvBlock::new(c * 4, c, device),
-            dec3: GeneratorDeconvBlock::new(c * 2, c, device),
+            dec2: GeneratorDeconvBlock::new(c * 2, c, device),
+            dec3: GeneratorDeconvBlock::new(c, c, device),
             final_conv: Conv2dConfig::new([c, CHANNELS], [3, 3])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .init(device),

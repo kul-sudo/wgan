@@ -5,6 +5,7 @@ use burn::{
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
     module::{Module, ModuleMapper, Param},
+    nn::loss::{MseLoss, Reduction},
     optim::{GradientsParams, Optimizer, RmsPropConfig},
     prelude::*,
     record::CompactRecorder,
@@ -148,6 +149,8 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
         .num_workers(2)
         .build(dataset);
 
+    let mse = MseLoss::new();
+
     for epoch in 0..config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
             let edited = batch.edited.detach();
@@ -174,19 +177,37 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
             }
 
             let reconstructed = generator.forward(edited.clone());
-            let score_recon = discriminator.forward(reconstructed.clone());
-            let loss_adv = -score_recon.mean();
+            let score_reconstructed = discriminator.forward(reconstructed.clone());
+            let loss_adv = -score_reconstructed.mean();
 
             let loss_l1 = (reconstructed.clone() - original.clone()).abs().mean();
 
-            let edges_recon = sobel(reconstructed.clone(), &device);
-            let edges_orig = sobel(original.clone(), &device).detach();
-            let loss_sobel = (edges_recon - edges_orig).abs().mean();
+            let edges_reconstructed = sobel(reconstructed.clone(), &device);
+            let edges_original = sobel(original.clone(), &device).detach();
+            let loss_sobel = mse.forward(edges_reconstructed, edges_original, Reduction::Mean);
 
-            const LAMBDA_L1: f32 = 10.0;
-            const LAMBDA_SOBEL: f32 = 120.0;
+            // const LAMBDA_ADV: f32 = 20.0;
+            // const LAMBDA_L1: f32 = 200.0;
+            // const LAMBDA_SOBEL: f32 = 800.0;
 
-            let loss_g = loss_adv + (loss_l1 * LAMBDA_L1) + (loss_sobel * LAMBDA_SOBEL);
+            // const LAMBDA_ADV: f32 = 20.0;
+            // const LAMBDA_L1: f32 = 150.0;
+            // const LAMBDA_SOBEL: f32 = 800.0;
+
+            const LAMBDA_ADV: f32 = 4000.0;
+            const LAMBDA_L1: f32 = 100.0;
+            const LAMBDA_SOBEL: f32 = 1200.0;
+
+            let loss_g = (loss_adv.clone() * LAMBDA_ADV)
+                + (loss_l1.clone() * LAMBDA_L1)
+                + (loss_sobel.clone() * LAMBDA_SOBEL);
+
+            println!(
+                "{} {} {}",
+                (loss_adv.into_scalar().to_f32() * LAMBDA_ADV),
+                (loss_l1.into_scalar().to_f32() * LAMBDA_L1),
+                (loss_sobel.into_scalar().to_f32() * LAMBDA_SOBEL)
+            );
 
             {
                 let grads = loss_g.backward();
@@ -200,12 +221,24 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
             }
 
             if iteration % 100 == 0 {
-                save_samples(epoch, iteration, edited, original, reconstructed);
+                save_samples(
+                    epoch,
+                    iteration,
+                    edited.clone().detach(),
+                    original.clone().detach(),
+                    reconstructed.clone().detach(),
+                );
             }
         }
-    }
 
-    generator
-        .save_file(format!("{ARTIFACT_DIR}/generator"), &CompactRecorder::new())
-        .expect("Failed to save generator");
+        if epoch % 20 == 0 {
+            generator
+                .clone()
+                .save_file(
+                    format!("{ARTIFACT_DIR}/generator_{}", epoch),
+                    &CompactRecorder::new(),
+                )
+                .unwrap()
+        }
+    }
 }
