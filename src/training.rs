@@ -1,15 +1,14 @@
 use crate::dataset::ImageBatcher;
 use crate::files::ImagePair;
-use crate::network::NetworkConfig;
+use crate::network::{Discriminator, NetworkConfig};
 use burn::{
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
-    module::{Module, ModuleMapper, Param},
-    nn::loss::{MseLoss, Reduction},
-    optim::{GradientsParams, Optimizer, RmsPropConfig},
+    module::Module,
+    optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
-    tensor::{backend::AutodiffBackend, module::conv2d, ops::ConvOptions},
+    tensor::{Distribution, Tensor, backend::AutodiffBackend},
 };
 use image::{GrayImage, Luma};
 use std::fs::create_dir_all;
@@ -19,55 +18,47 @@ const ARTIFACT_DIR: &str = "artifact";
 #[derive(Debug, Config)]
 pub struct TrainingConfig {
     pub model: NetworkConfig,
-    pub optimizer: RmsPropConfig,
+    pub optimizer: AdamConfig,
     #[config(default = 500)]
     pub num_epochs: usize,
     #[config(default = 8)]
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
-    #[config(default = 1e-4)]
+    #[config(default = 1e-5)]
     pub lr: f64,
     #[config(default = 5)]
     pub num_critic: usize,
+    #[config(default = 0.1)]
+    pub lambda_adv: f32,
+    #[config(default = 100.0)]
+    pub lambda_l1: f32,
+    #[config(default = 600.0)]
+    pub lambda_perceptual: f32,
 }
 
-#[derive(Module, Clone, Debug)]
-pub struct Clip {
-    pub min: f32,
-    pub max: f32,
-}
+fn gradient_penalty<B: AutodiffBackend>(
+    discriminator: &Discriminator<B>,
+    real: Tensor<B, 4>,
+    fake: Tensor<B, 4>,
+) -> Tensor<B::InnerBackend, 1> {
+    let alpha = Tensor::<B, 4>::random_like(&real, Distribution::Uniform(0.0, 1.0));
+    let interpolates = real.mul(alpha.clone()) + fake.mul(alpha.neg().add_scalar(1.0));
 
-impl<B: AutodiffBackend> ModuleMapper<B> for Clip {
-    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
-        let (id, tensor, mapper) = param.consume();
-        let is_require_grad = tensor.is_require_grad();
+    let interpolates = interpolates.require_grad();
 
-        let mut tensor = Tensor::from_inner(tensor.inner().clamp(self.min, self.max));
+    let d_output = discriminator.forward(interpolates.clone());
+    let grads = d_output.sum().backward();
 
-        if is_require_grad {
-            tensor = tensor.require_grad();
-        }
-        Param::from_mapped_value(id, tensor, mapper)
-    }
-}
+    let grad_wrt_interp = interpolates.grad(&grads).unwrap();
 
-fn sobel<B: Backend>(x: Tensor<B, 4>, device: &B::Device) -> Tensor<B, 4> {
-    let opts = ConvOptions::new([1, 1], [1, 1], [1, 1], 1);
+    let flattened: Tensor<B::InnerBackend, 2> = grad_wrt_interp.flatten(1, 3);
+    let grad_norm: Tensor<B::InnerBackend, 2> =
+        (flattened.powf_scalar(2.0).sum_dim(1) + 1e-8).sqrt();
+    let gradient_penalty: Tensor<B::InnerBackend, 1> =
+        grad_norm.sub_scalar(1.0).powf_scalar(2.0).mean();
 
-    let gx = Tensor::<B, 4>::from_data(
-        [[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]],
-        device,
-    );
-    let gy = Tensor::<B, 4>::from_data(
-        [[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]],
-        device,
-    );
-
-    let x_edges = conv2d(x.clone(), gx, None, opts.clone());
-    let y_edges = conv2d(x, gy, None, opts);
-
-    (x_edges.powf_scalar(2.0) + y_edges.powf_scalar(2.0) + 1e-8).sqrt()
+    gradient_penalty
 }
 
 fn save_samples<B: Backend>(
@@ -122,16 +113,9 @@ fn save_samples<B: Backend>(
 pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     create_dir_all(ARTIFACT_DIR).unwrap();
 
-    let optimizer_config = RmsPropConfig::new()
-        .with_alpha(0.99)
-        .with_weight_decay(None);
+    let optimizer_config = AdamConfig::new().with_beta_1(0.0).with_beta_2(0.9);
 
     let config = TrainingConfig::new(NetworkConfig::new(), optimizer_config);
-
-    let mut clip = Clip {
-        min: -0.01,
-        max: 0.01,
-    };
 
     config.save(format!("{ARTIFACT_DIR}/config.json")).unwrap();
     B::seed(&device, config.seed);
@@ -149,64 +133,56 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
         .num_workers(2)
         .build(dataset);
 
-    let mse = MseLoss::new();
-
     for epoch in 0..config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
-            let edited = batch.edited.detach();
-            let original = batch.original.detach();
-
-            let fake_images = generator.forward(edited.clone()).detach();
+            let fake_images = generator.forward(batch.edited.clone()).detach();
             for i in 0..config.num_critic {
                 let score_fake = discriminator.forward(fake_images.clone());
-                let score_real = discriminator.forward(original.clone());
+                let score_real = discriminator.forward(batch.original.clone());
 
-                let loss_d = score_fake.mean() - score_real.mean();
+                let loss_wasserstein = score_fake.mean() - score_real.mean();
+
+                let gp_inner =
+                    gradient_penalty(&discriminator, batch.original.clone(), fake_images.clone());
+                let gp = Tensor::<B, 1>::from_inner(gp_inner);
+
+                let loss_d = loss_wasserstein + gp.mul_scalar(10.0);
 
                 if i == 0 && iteration % 10 == 0 {
                     println!("Loss D: {}", loss_d.clone().into_scalar().to_f32());
                 }
 
-                {
-                    let grads = loss_d.backward();
-                    let grads = GradientsParams::from_grads(grads, &discriminator);
-                    discriminator = optimizer_d.step(config.lr, discriminator, grads);
-                }
-
-                discriminator = discriminator.map(&mut clip);
+                let grads = loss_d.backward();
+                let grads = GradientsParams::from_grads(grads, &discriminator);
+                discriminator = optimizer_d.step(config.lr, discriminator, grads);
             }
 
-            let reconstructed = generator.forward(edited.clone());
-            let score_reconstructed = discriminator.forward(reconstructed.clone());
+            let reconstructed = generator.forward(batch.edited.clone());
+
+            let (_, feat_real1, feat_real2) =
+                discriminator.forward_with_features(batch.original.clone());
+            let (score_reconstructed, feat_fake1, feat_fake2) =
+                discriminator.forward_with_features(reconstructed.clone());
+
             let loss_adv = -score_reconstructed.mean();
 
-            let loss_l1 = (reconstructed.clone() - original.clone()).abs().mean();
+            let loss_l1 = (reconstructed.clone() - batch.original.clone())
+                .abs()
+                .mean();
 
-            let edges_reconstructed = sobel(reconstructed.clone(), &device);
-            let edges_original = sobel(original.clone(), &device).detach();
-            let loss_sobel = mse.forward(edges_reconstructed, edges_original, Reduction::Mean);
+            let loss_feat1 = (feat_real1.detach() - feat_fake1).abs().mean();
+            let loss_feat2 = (feat_real2.detach() - feat_fake2).abs().mean();
+            let loss_perceptual = loss_feat1 + loss_feat2;
 
-            // const LAMBDA_ADV: f32 = 20.0;
-            // const LAMBDA_L1: f32 = 200.0;
-            // const LAMBDA_SOBEL: f32 = 800.0;
-
-            // const LAMBDA_ADV: f32 = 20.0;
-            // const LAMBDA_L1: f32 = 150.0;
-            // const LAMBDA_SOBEL: f32 = 800.0;
-
-            const LAMBDA_ADV: f32 = 4000.0;
-            const LAMBDA_L1: f32 = 100.0;
-            const LAMBDA_SOBEL: f32 = 1200.0;
-
-            let loss_g = (loss_adv.clone() * LAMBDA_ADV)
-                + (loss_l1.clone() * LAMBDA_L1)
-                + (loss_sobel.clone() * LAMBDA_SOBEL);
+            let loss_g = (loss_adv.clone() * config.lambda_adv)
+                + (loss_l1.clone() * config.lambda_l1)
+                + (loss_perceptual.clone() * config.lambda_perceptual);
 
             println!(
-                "{} {} {}",
-                (loss_adv.into_scalar().to_f32() * LAMBDA_ADV),
-                (loss_l1.into_scalar().to_f32() * LAMBDA_L1),
-                (loss_sobel.into_scalar().to_f32() * LAMBDA_SOBEL)
+                "{:.2} {:.2} {:.2}",
+                (loss_adv.into_scalar().to_f32() * config.lambda_adv),
+                (loss_l1.into_scalar().to_f32() * config.lambda_l1),
+                (loss_perceptual.into_scalar().to_f32() * config.lambda_perceptual)
             );
 
             {
@@ -224,9 +200,9 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
                 save_samples(
                     epoch,
                     iteration,
-                    edited.clone().detach(),
-                    original.clone().detach(),
-                    reconstructed.clone().detach(),
+                    batch.edited,
+                    batch.original,
+                    reconstructed,
                 );
             }
         }

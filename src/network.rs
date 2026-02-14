@@ -118,11 +118,14 @@ impl<B: Backend> Generator<B> {
         let x = Tensor::cat(vec![x, s3], 1);
 
         let x = self.dec1.forward(x);
+        let x = Tensor::cat(vec![x, s2], 1);
 
         let x = self.dec2.forward(x);
+        let x = Tensor::cat(vec![x, s1], 1);
 
         let x = self.dec3.forward(x);
         let x = self.final_conv.forward(x);
+
         tanh(x)
     }
 }
@@ -137,20 +140,37 @@ pub struct Discriminator<B: Backend> {
 }
 
 impl<B: Backend> Discriminator<B> {
-    pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 2> {
         let x = self.noise.forward(images);
 
         let x = self.conv1.forward(x);
         let x = self.conv2.forward(x);
         let x = self.conv3.forward(x);
 
-        self.final_layer.forward(x)
+        let x = self.final_layer.forward(x);
+        x.mean_dim(2).mean_dim(3).flatten(1, 3)
+    }
+
+    pub fn forward_with_features(
+        &self,
+        images: Tensor<B, 4>,
+    ) -> (Tensor<B, 2>, Tensor<B, 4>, Tensor<B, 4>) {
+        let x = self.noise.forward(images);
+
+        let f1 = self.conv1.forward(x);
+        let f2 = self.conv2.forward(f1.clone());
+        let x = self.conv3.forward(f2.clone());
+
+        let x = self.final_layer.forward(x);
+        let score = x.mean_dim(2).mean_dim(3).flatten(1, 3);
+
+        (score, f1, f2)
     }
 }
 
 #[derive(Config, Debug)]
 pub struct NetworkConfig {
-    #[config(default = 32)]
+    #[config(default = 64)]
     pub base_channels: usize,
 }
 
@@ -165,8 +185,8 @@ impl NetworkConfig {
             enc4: GeneratorConvBlock::new(c * 4, c * 8, 2, device),
             dec4: GeneratorDeconvBlock::new(c * 8, c * 4, device),
             dec1: GeneratorDeconvBlock::new(c * 8, c * 2, device),
-            dec2: GeneratorDeconvBlock::new(c * 2, c, device),
-            dec3: GeneratorDeconvBlock::new(c, c, device),
+            dec2: GeneratorDeconvBlock::new(c * 4, c, device),
+            dec3: GeneratorDeconvBlock::new(c * 2, c, device),
             final_conv: Conv2dConfig::new([c, CHANNELS], [3, 3])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .init(device),
