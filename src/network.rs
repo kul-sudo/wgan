@@ -1,4 +1,5 @@
 use crate::consts::CHANNELS;
+use crate::netperceptual::{PerceptualNet, PerceptualNetConfig};
 use burn::{
     config::Config,
     module::Module,
@@ -18,23 +19,32 @@ use burn::{
 #[derive(Module, Debug)]
 pub struct DiscriminatorBlock<B: Backend> {
     conv: Conv2d<B>,
-    bn: InstanceNorm<B>,
+    norm: InstanceNorm<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct DiscriminatorBlockConfig {
+    in_channels: usize,
+    out_channels: usize,
+    stride: usize,
+}
+
+impl DiscriminatorBlockConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> DiscriminatorBlock<B> {
+        DiscriminatorBlock {
+            conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
+                .with_stride([self.stride, self.stride])
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .init(device),
+            norm: InstanceNormConfig::new(self.out_channels).init(device),
+        }
+    }
 }
 
 impl<B: Backend> DiscriminatorBlock<B> {
-    pub fn new(in_channels: usize, out_channels: usize, stride: usize, device: &B::Device) -> Self {
-        let conv = Conv2dConfig::new([in_channels, out_channels], [3, 3])
-            .with_stride([stride, stride])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
-            .init(device);
-        let bn = InstanceNormConfig::new(out_channels).init(device);
-
-        Self { conv, bn }
-    }
-
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv.forward(input);
-        let x = self.bn.forward(x);
+        let x = self.norm.forward(x);
         leaky_relu(x, 0.2)
     }
 }
@@ -42,23 +52,32 @@ impl<B: Backend> DiscriminatorBlock<B> {
 #[derive(Module, Debug)]
 pub struct GeneratorConvBlock<B: Backend> {
     conv: Conv2d<B>,
-    bn: InstanceNorm<B>,
+    norm: InstanceNorm<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct GeneratorConvBlockConfig {
+    in_channels: usize,
+    out_channels: usize,
+    stride: usize,
+}
+
+impl GeneratorConvBlockConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> GeneratorConvBlock<B> {
+        GeneratorConvBlock {
+            conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
+                .with_stride([self.stride, self.stride])
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .init(device),
+            norm: InstanceNormConfig::new(self.out_channels).init(device),
+        }
+    }
 }
 
 impl<B: Backend> GeneratorConvBlock<B> {
-    pub fn new(in_channels: usize, out_channels: usize, stride: usize, device: &B::Device) -> Self {
-        let conv = Conv2dConfig::new([in_channels, out_channels], [3, 3])
-            .with_stride([stride, stride])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
-            .init(device);
-        let bn = InstanceNormConfig::new(out_channels).init(device);
-
-        Self { conv, bn }
-    }
-
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv.forward(input);
-        let x = self.bn.forward(x);
+        let x = self.norm.forward(x);
         mish(x)
     }
 }
@@ -66,19 +85,27 @@ impl<B: Backend> GeneratorConvBlock<B> {
 #[derive(Module, Debug)]
 pub struct GeneratorDeconvBlock<B: Backend> {
     conv: Conv2d<B>,
-    bn: InstanceNorm<B>,
+    norm: InstanceNorm<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct GeneratorDeconvBlockConfig {
+    in_channels: usize,
+    out_channels: usize,
+}
+
+impl GeneratorDeconvBlockConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> GeneratorDeconvBlock<B> {
+        GeneratorDeconvBlock {
+            conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .init(device),
+            norm: InstanceNormConfig::new(self.out_channels).init(device),
+        }
+    }
 }
 
 impl<B: Backend> GeneratorDeconvBlock<B> {
-    pub fn new(in_channels: usize, out_channels: usize, device: &B::Device) -> Self {
-        let conv = Conv2dConfig::new([in_channels, out_channels], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
-            .init(device);
-        let bn = InstanceNormConfig::new(out_channels).init(device);
-
-        Self { conv, bn }
-    }
-
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let [_batch, _channels, h, w] = input.dims();
 
@@ -89,7 +116,7 @@ impl<B: Backend> GeneratorDeconvBlock<B> {
         );
 
         let x = self.conv.forward(x);
-        let x = self.bn.forward(x);
+        let x = self.norm.forward(x);
         mish(x)
     }
 }
@@ -105,6 +132,31 @@ pub struct Generator<B: Backend> {
     pub dec2: GeneratorDeconvBlock<B>,
     pub dec3: GeneratorDeconvBlock<B>,
     pub final_conv: Conv2d<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct GeneratorConfig {
+    hidden_channels: usize,
+}
+
+impl GeneratorConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Generator<B> {
+        let c = self.hidden_channels;
+
+        Generator {
+            enc1: GeneratorConvBlockConfig::new(CHANNELS, c, 2).init(device),
+            enc2: GeneratorConvBlockConfig::new(c, c * 2, 2).init(device),
+            enc3: GeneratorConvBlockConfig::new(c * 2, c * 4, 2).init(device),
+            enc4: GeneratorConvBlockConfig::new(c * 4, c * 8, 2).init(device),
+            dec4: GeneratorDeconvBlockConfig::new(c * 8, c * 4).init(device),
+            dec1: GeneratorDeconvBlockConfig::new(c * 8, c * 2).init(device),
+            dec2: GeneratorDeconvBlockConfig::new(c * 4, c).init(device),
+            dec3: GeneratorDeconvBlockConfig::new(c * 2, c).init(device),
+            final_conv: Conv2dConfig::new([c, CHANNELS], [3, 3])
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .init(device),
+        }
+    }
 }
 
 impl<B: Backend> Generator<B> {
@@ -150,58 +202,33 @@ impl<B: Backend> Discriminator<B> {
         let x = self.final_layer.forward(x);
         x.mean_dim(2).mean_dim(3).flatten(1, 3)
     }
-
-    pub fn forward_with_features(
-        &self,
-        images: Tensor<B, 4>,
-    ) -> (Tensor<B, 2>, Tensor<B, 4>, Tensor<B, 4>) {
-        let x = self.noise.forward(images);
-
-        let f1 = self.conv1.forward(x);
-        let f2 = self.conv2.forward(f1.clone());
-        let x = self.conv3.forward(f2.clone());
-
-        let x = self.final_layer.forward(x);
-        let score = x.mean_dim(2).mean_dim(3).flatten(1, 3);
-
-        (score, f1, f2)
-    }
 }
 
 #[derive(Config, Debug)]
 pub struct NetworkConfig {
     #[config(default = 64)]
-    pub base_channels: usize,
+    pub hidden_channels: usize,
 }
 
 impl NetworkConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> (Generator<B>, Discriminator<B>) {
-        let c = self.base_channels;
+    pub fn init<B: Backend>(
+        &self,
+        device: &B::Device,
+    ) -> (Generator<B>, Discriminator<B>, PerceptualNet<B>) {
+        let c = self.hidden_channels;
 
-        let generator = Generator {
-            enc1: GeneratorConvBlock::new(CHANNELS, c, 2, device),
-            enc2: GeneratorConvBlock::new(c, c * 2, 2, device),
-            enc3: GeneratorConvBlock::new(c * 2, c * 4, 2, device),
-            enc4: GeneratorConvBlock::new(c * 4, c * 8, 2, device),
-            dec4: GeneratorDeconvBlock::new(c * 8, c * 4, device),
-            dec1: GeneratorDeconvBlock::new(c * 8, c * 2, device),
-            dec2: GeneratorDeconvBlock::new(c * 4, c, device),
-            dec3: GeneratorDeconvBlock::new(c * 2, c, device),
-            final_conv: Conv2dConfig::new([c, CHANNELS], [3, 3])
-                .with_padding(PaddingConfig2d::Explicit(1, 1))
-                .init(device),
-        };
-
+        let generator = GeneratorConfig::new(c).init(device);
         let discriminator = Discriminator {
             noise: GaussianNoiseConfig::new(0.05).init(),
-            conv1: DiscriminatorBlock::new(CHANNELS, c, 2, device),
-            conv2: DiscriminatorBlock::new(c, c * 2, 2, device),
-            conv3: DiscriminatorBlock::new(c * 2, c * 4, 2, device),
+            conv1: DiscriminatorBlockConfig::new(CHANNELS, c, 2).init(device),
+            conv2: DiscriminatorBlockConfig::new(c, c * 2, 2).init(device),
+            conv3: DiscriminatorBlockConfig::new(c * 2, c * 4, 2).init(device),
             final_layer: Conv2dConfig::new([c * 4, 1], [3, 3])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .init(device),
         };
+        let perceptual_net = PerceptualNetConfig::new(CHANNELS, c).init(device);
 
-        (generator, discriminator)
+        (generator, discriminator, perceptual_net)
     }
 }

@@ -29,11 +29,11 @@ pub struct TrainingConfig {
     pub lr: f64,
     #[config(default = 5)]
     pub num_critic: usize,
-    #[config(default = 0.1)]
+    #[config(default = 2.0)]
     pub lambda_adv: f32,
-    #[config(default = 100.0)]
+    #[config(default = 12.0)]
     pub lambda_l1: f32,
-    #[config(default = 600.0)]
+    #[config(default = 3000.0)]
     pub lambda_perceptual: f32,
 }
 
@@ -53,10 +53,8 @@ fn gradient_penalty<B: AutodiffBackend>(
     let grad_wrt_interp = interpolates.grad(&grads).unwrap();
 
     let flattened: Tensor<B::InnerBackend, 2> = grad_wrt_interp.flatten(1, 3);
-    let grad_norm: Tensor<B::InnerBackend, 2> =
-        (flattened.powf_scalar(2.0).sum_dim(1) + 1e-8).sqrt();
-    let gradient_penalty: Tensor<B::InnerBackend, 1> =
-        grad_norm.sub_scalar(1.0).powf_scalar(2.0).mean();
+    let grad_norm: Tensor<B::InnerBackend, 2> = (flattened.square().sum_dim(1) + 1e-8).sqrt();
+    let gradient_penalty: Tensor<B::InnerBackend, 1> = grad_norm.sub_scalar(1.0).square().mean();
 
     gradient_penalty
 }
@@ -120,7 +118,7 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     config.save(format!("{ARTIFACT_DIR}/config.json")).unwrap();
     B::seed(&device, config.seed);
 
-    let (mut generator, mut discriminator) = config.model.init::<B>(&device);
+    let (mut generator, mut discriminator, perceptual_net) = config.model.init::<B>(&device);
     let mut optimizer_g = config.optimizer.init();
     let mut optimizer_d = config.optimizer.init();
 
@@ -159,20 +157,19 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
             let reconstructed = generator.forward(batch.edited.clone());
 
-            let (_, feat_real1, feat_real2) =
-                discriminator.forward_with_features(batch.original.clone());
-            let (score_reconstructed, feat_fake1, feat_fake2) =
-                discriminator.forward_with_features(reconstructed.clone());
-
+            let score_reconstructed = discriminator.forward(reconstructed.clone());
             let loss_adv = -score_reconstructed.mean();
 
             let loss_l1 = (reconstructed.clone() - batch.original.clone())
                 .abs()
                 .mean();
 
-            let loss_feat1 = (feat_real1.detach() - feat_fake1).abs().mean();
-            let loss_feat2 = (feat_real2.detach() - feat_fake2).abs().mean();
-            let loss_perceptual = loss_feat1 + loss_feat2;
+            let (f_real1, f_real2, f_real3) = perceptual_net.forward(batch.original.clone());
+            let (f_fake1, f_fake2, f_fake3) = perceptual_net.forward(reconstructed.clone());
+
+            let loss_perceptual = (f_real1.detach() - f_fake1).abs().mean()
+                + (f_real2.detach() - f_fake2).abs().mean()
+                + (f_real3.detach() - f_fake3).abs().mean();
 
             let loss_g = (loss_adv.clone() * config.lambda_adv)
                 + (loss_l1.clone() * config.lambda_l1)

@@ -1,6 +1,7 @@
 mod consts;
 mod dataset;
 mod files;
+mod netperceptual;
 mod network;
 mod training;
 
