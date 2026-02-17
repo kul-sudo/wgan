@@ -3,7 +3,7 @@ use burn::{
     module::Module,
     nn::PaddingConfig2d,
     nn::conv::{Conv2d, Conv2dConfig},
-    tensor::{Tensor, activation::mish, backend::Backend},
+    tensor::{Tensor, activation::leaky_relu, backend::Backend},
 };
 
 #[derive(Config, Debug)]
@@ -45,8 +45,8 @@ pub struct PerceptualNet<B: Backend> {
 
 impl<B: Backend> PerceptualNet<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
-        let f1 = mish(self.conv1.forward(x));
-        let f2 = mish(self.conv2.forward(f1.clone()));
+        let f1 = leaky_relu(self.conv1.forward(x), 0.2);
+        let f2 = leaky_relu(self.conv2.forward(f1.clone()), 0.2);
         let f3 = self.conv3.forward(f2.clone());
 
         (f1, f2, f3)

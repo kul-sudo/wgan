@@ -9,7 +9,7 @@ use burn::{
     },
     tensor::{
         Tensor,
-        activation::{leaky_relu, mish, tanh},
+        activation::{leaky_relu, tanh},
         backend::Backend,
         module::interpolate,
         ops::{InterpolateMode, InterpolateOptions},
@@ -78,7 +78,7 @@ impl<B: Backend> GeneratorConvBlock<B> {
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv.forward(input);
         let x = self.norm.forward(x);
-        mish(x)
+        leaky_relu(x, 0.2)
     }
 }
 
@@ -117,7 +117,7 @@ impl<B: Backend> GeneratorDeconvBlock<B> {
 
         let x = self.conv.forward(x);
         let x = self.norm.forward(x);
-        mish(x)
+        leaky_relu(x, 0.2)
     }
 }
 

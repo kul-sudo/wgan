@@ -5,6 +5,7 @@ use burn::{
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
     module::Module,
+    nn::loss::{MseLoss, Reduction},
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
@@ -31,9 +32,9 @@ pub struct TrainingConfig {
     pub num_critic: usize,
     #[config(default = 2.0)]
     pub lambda_adv: f32,
-    #[config(default = 12.0)]
+    #[config(default = 60.0)]
     pub lambda_l1: f32,
-    #[config(default = 3000.0)]
+    #[config(default = 15000.0)]
     pub lambda_perceptual: f32,
 }
 
@@ -111,8 +112,8 @@ fn save_samples<B: Backend>(
 pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     create_dir_all(ARTIFACT_DIR).unwrap();
 
+    let mse_loss = MseLoss::new();
     let optimizer_config = AdamConfig::new().with_beta_1(0.0).with_beta_2(0.9);
-
     let config = TrainingConfig::new(NetworkConfig::new(), optimizer_config);
 
     config.save(format!("{ARTIFACT_DIR}/config.json")).unwrap();
@@ -167,9 +168,9 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
             let (f_real1, f_real2, f_real3) = perceptual_net.forward(batch.original.clone());
             let (f_fake1, f_fake2, f_fake3) = perceptual_net.forward(reconstructed.clone());
 
-            let loss_perceptual = (f_real1.detach() - f_fake1).abs().mean()
-                + (f_real2.detach() - f_fake2).abs().mean()
-                + (f_real3.detach() - f_fake3).abs().mean();
+            let loss_perceptual = mse_loss.forward(f_fake1, f_real1.detach(), Reduction::Mean)
+                + mse_loss.forward(f_fake2, f_real2.detach(), Reduction::Mean)
+                + mse_loss.forward(f_fake3, f_real3.detach(), Reduction::Mean);
 
             let loss_g = (loss_adv.clone() * config.lambda_adv)
                 + (loss_l1.clone() * config.lambda_l1)
