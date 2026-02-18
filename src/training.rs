@@ -9,7 +9,7 @@ use burn::{
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
-    tensor::{Distribution, Tensor, backend::AutodiffBackend},
+    tensor::{Distribution, Tensor, backend::AutodiffBackend, module::conv2d, ops::ConvOptions},
 };
 use image::{GrayImage, Luma};
 use std::fs::create_dir_all;
@@ -26,38 +26,66 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
-    #[config(default = 1e-5)]
-    pub lr: f64,
+    #[config(default = 3e-4)]
+    pub discriminator_lr: f64,
+    #[config(default = 1e-4)]
+    pub generator_lr: f64,
     #[config(default = 5)]
     pub num_critic: usize,
-    #[config(default = 2.0)]
+    #[config(default = 1.0)]
     pub lambda_adv: f32,
-    #[config(default = 60.0)]
+    #[config(default = 20.0)]
     pub lambda_l1: f32,
-    #[config(default = 15000.0)]
+    #[config(default = 200.0)]
     pub lambda_perceptual: f32,
+    #[config(default = 10.0)]
+    pub lambda_sobel: f32,
+}
+
+fn sobel<B: Backend>(x: Tensor<B, 4>, device: &B::Device) -> Tensor<B, 4> {
+    let opts = ConvOptions::new([1, 1], [1, 1], [1, 1], 1);
+
+    let gx = Tensor::<B, 4>::from_data(
+        [[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]],
+        device,
+    );
+    let gy = Tensor::<B, 4>::from_data(
+        [[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]],
+        device,
+    );
+
+    let x_edges = conv2d(x.clone(), gx, None, opts.clone());
+    let y_edges = conv2d(x, gy, None, opts);
+
+    (x_edges.powf_scalar(2.0) + y_edges.powf_scalar(2.0) + 1e-8).sqrt()
 }
 
 fn gradient_penalty<B: AutodiffBackend>(
     discriminator: &Discriminator<B>,
-    real: Tensor<B, 4>,
-    fake: Tensor<B, 4>,
-) -> Tensor<B::InnerBackend, 1> {
-    let alpha = Tensor::<B, 4>::random_like(&real, Distribution::Uniform(0.0, 1.0));
-    let interpolates = real.mul(alpha.clone()) + fake.mul(alpha.neg().add_scalar(1.0));
+    real_samples: Tensor<B, 4>,
+    fake_samples: Tensor<B, 4>,
+) -> Tensor<B, 1> {
+    let [batch_size, channels, height, width] = real_samples.dims();
+    let device = real_samples.device();
 
+    let alpha = Tensor::<B, 4>::random([batch_size, 1, 1, 1], Distribution::Default, &device);
+
+    let interpolates = alpha.clone() * real_samples + ((-alpha + 1.0) * fake_samples);
     let interpolates = interpolates.require_grad();
 
-    let d_output = discriminator.forward(interpolates.clone());
-    let grads = d_output.sum().backward();
+    let score = discriminator.forward(interpolates.clone());
+    let grads = score.sum().backward();
 
-    let grad_wrt_interp = interpolates.grad(&grads).unwrap();
+    let gradients = interpolates.grad(&grads).unwrap();
 
-    let flattened: Tensor<B::InnerBackend, 2> = grad_wrt_interp.flatten(1, 3);
-    let grad_norm: Tensor<B::InnerBackend, 2> = (flattened.square().sum_dim(1) + 1e-8).sqrt();
-    let gradient_penalty: Tensor<B::InnerBackend, 1> = grad_norm.sub_scalar(1.0).square().mean();
+    let norm = gradients
+        .square()
+        .sum_dims(&[1, 2, 3])
+        .add_scalar(1e-8)
+        .sqrt();
+    let penalty = (norm - 1.0).square().mean();
 
-    gradient_penalty
+    Tensor::<B, 1>::from_inner(penalty)
 }
 
 fn save_samples<B: Backend>(
@@ -113,7 +141,10 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     create_dir_all(ARTIFACT_DIR).unwrap();
 
     let mse_loss = MseLoss::new();
-    let optimizer_config = AdamConfig::new().with_beta_1(0.0).with_beta_2(0.9);
+    let optimizer_config = AdamConfig::new()
+        .with_beta_1(0.5)
+        .with_beta_2(0.9)
+        .with_weight_decay(None);
     let config = TrainingConfig::new(NetworkConfig::new(), optimizer_config);
 
     config.save(format!("{ARTIFACT_DIR}/config.json")).unwrap();
@@ -141,11 +172,17 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
                 let loss_wasserstein = score_fake.mean() - score_real.mean();
 
-                let gp_inner =
+                let gp =
                     gradient_penalty(&discriminator, batch.original.clone(), fake_images.clone());
-                let gp = Tensor::<B, 1>::from_inner(gp_inner);
 
                 let loss_d = loss_wasserstein + gp.mul_scalar(10.0);
+
+                // if loss_d.clone().is_nan().any().into_scalar().to_bool() {
+                //     panic!(
+                //         "NaN detected in Loss D! Iteration: {}, Epoch: {}",
+                //         iteration, epoch
+                //     );
+                // }
 
                 if i == 0 && iteration % 10 == 0 {
                     println!("Loss D: {}", loss_d.clone().into_scalar().to_f32());
@@ -153,12 +190,26 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
                 let grads = loss_d.backward();
                 let grads = GradientsParams::from_grads(grads, &discriminator);
-                discriminator = optimizer_d.step(config.lr, discriminator, grads);
+
+                discriminator = optimizer_d.step(config.discriminator_lr, discriminator, grads);
             }
 
             let reconstructed = generator.forward(batch.edited.clone());
 
+            // if reconstructed.clone().is_nan().any().into_scalar().to_bool() {
+            //     panic!("Grave Error: Generator produced NaNs in the image pixels!");
+            // }
+
             let score_reconstructed = discriminator.forward(reconstructed.clone());
+            // if score_reconstructed
+            //     .clone()
+            //     .is_nan()
+            //     .any()
+            //     .into_scalar()
+            //     .to_bool()
+            // {
+            //     panic!("Grave Error: Discriminator Score is NaN! Check Gradient Penalty.");
+            // }
             let loss_adv = -score_reconstructed.mean();
 
             let loss_l1 = (reconstructed.clone() - batch.original.clone())
@@ -172,21 +223,34 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
                 + mse_loss.forward(f_fake2, f_real2.detach(), Reduction::Mean)
                 + mse_loss.forward(f_fake3, f_real3.detach(), Reduction::Mean);
 
+            let edges_real = sobel(batch.original.clone(), &device);
+            let edges_fake = sobel(reconstructed.clone(), &device);
+            let loss_sobel = (edges_fake - edges_real).abs().mean();
+
             let loss_g = (loss_adv.clone() * config.lambda_adv)
                 + (loss_l1.clone() * config.lambda_l1)
-                + (loss_perceptual.clone() * config.lambda_perceptual);
+                + (loss_perceptual.clone() * config.lambda_perceptual)
+                + (loss_sobel.clone() * config.lambda_sobel);
+
+            // if loss_g.clone().is_nan().any().into_scalar().to_bool() {
+            //     panic!(
+            //         "NaN detected in Loss G! Iteration: {}, Epoch: {}",
+            //         iteration, epoch
+            //     );
+            // }
 
             println!(
-                "{:.2} {:.2} {:.2}",
+                "{:.2} {:.2} {:.2} {:.2}",
                 (loss_adv.into_scalar().to_f32() * config.lambda_adv),
                 (loss_l1.into_scalar().to_f32() * config.lambda_l1),
-                (loss_perceptual.into_scalar().to_f32() * config.lambda_perceptual)
+                (loss_perceptual.into_scalar().to_f32() * config.lambda_perceptual),
+                (loss_sobel.into_scalar().to_f32() * config.lambda_sobel)
             );
 
             {
                 let grads = loss_g.backward();
                 let grads = GradientsParams::from_grads(grads, &generator);
-                generator = optimizer_g.step(config.lr, generator, grads);
+                generator = optimizer_g.step(config.generator_lr, generator, grads);
             }
 
             if iteration % 10 == 0 {
