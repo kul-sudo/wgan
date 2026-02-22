@@ -1,22 +1,18 @@
 use crate::consts::CHANNELS;
-use crate::nets::{
-    flashattention::FlashAttentionV3,
-    perceptual::{PerceptualNet, PerceptualNetConfig},
-};
+use crate::nets::perceptual::{PerceptualNet, PerceptualNetConfig};
 use burn::{
     config::Config,
     module::{Initializer, Module, RunningState},
     nn::{
-        GaussianNoise, GaussianNoiseConfig, InstanceNorm, InstanceNormConfig, LayerNorm,
-        LayerNormConfig, PaddingConfig2d,
+        GaussianNoise, GaussianNoiseConfig, GroupNorm, GroupNormConfig, PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},
     },
     tensor::{
         Distribution, Tensor,
         activation::{leaky_relu, tanh},
         backend::Backend,
-        linalg::{Norm, vector_norm, vector_normalize},
-        module::{conv2d, interpolate},
+        linalg::{Norm, vector_normalize},
+        module::{attention, conv2d, interpolate},
         ops::ConvOptions,
         ops::{InterpolateMode, InterpolateOptions},
     },
@@ -30,15 +26,15 @@ fn spectral_norm<B: Backend>(
 ) -> (Tensor<B, 4>, Tensor<B, 2>) {
     let [oc, ic, kh, kw] = weight.dims();
     let w_mat = weight.clone().reshape([oc, ic * kh * kw]);
-
-    let v = u.clone().matmul(w_mat.clone());
-    let v = vector_normalize(v, Norm::L2, 1, 1e-12);
-
-    let u_new = w_mat.clone().matmul(v.clone().transpose()).transpose();
-    let u_new = vector_normalize(u_new, Norm::L2, 1, 1e-12);
-
+    let v = vector_normalize(u.clone().matmul(w_mat.clone()), Norm::L2, 1, 1e-8);
+    let u_new = vector_normalize(
+        v.clone().matmul(w_mat.clone().transpose()),
+        Norm::L2,
+        1,
+        1e-8,
+    );
     let sigma = u_new.clone().matmul(w_mat).matmul(v.transpose());
-    let weight_sn = weight.div(sigma.reshape([1, 1, 1, 1]));
+    let weight_sn = weight.div(sigma.reshape([1, 1, 1, 1]).add_scalar(1e-8));
 
     (weight_sn, u_new.detach())
 }
@@ -46,7 +42,6 @@ fn spectral_norm<B: Backend>(
 #[derive(Module, Debug)]
 pub struct DiscriminatorBlock<B: Backend> {
     conv: Conv2d<B>,
-    norm: Option<LayerNorm<B>>,
     u: RunningState<Tensor<B, 2>>,
 }
 
@@ -55,7 +50,6 @@ pub struct DiscriminatorBlockConfig {
     in_channels: usize,
     out_channels: usize,
     stride: usize,
-    use_norm: bool,
 }
 
 impl DiscriminatorBlockConfig {
@@ -65,16 +59,13 @@ impl DiscriminatorBlockConfig {
         DiscriminatorBlock {
             conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
                 .with_stride([self.stride, self.stride])
-                .with_padding(PaddingConfig2d::Explicit(1, 1))
-                .with_bias(false) // before InstanceNorm
+                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_bias(true)
                 .with_initializer(Initializer::KaimingNormal {
                     gain: leaky_gain,
                     fan_out_only: false,
                 })
                 .init(device),
-            norm: self
-                .use_norm
-                .then(|| LayerNormConfig::new(self.out_channels).init(device)),
             u: RunningState::new(Tensor::<B, 2>::random(
                 [1, self.out_channels],
                 Distribution::Default,
@@ -85,7 +76,7 @@ impl DiscriminatorBlockConfig {
 }
 
 impl<B: Backend> DiscriminatorBlock<B> {
-    pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, input: Tensor<B, 4>, activation: bool) -> Tensor<B, 4> {
         let weight = self.conv.weight.val();
         let u_current = self.u.value();
 
@@ -105,19 +96,18 @@ impl<B: Backend> DiscriminatorBlock<B> {
             ),
         );
 
-        let x = self.norm.as_ref().map_or(x.clone(), |norm| {
-            let x = x.swap_dims(1, 3).swap_dims(1, 2);
-            let x = norm.forward(x);
-            x.swap_dims(1, 2).swap_dims(1, 3)
-        });
-        leaky_relu(x, NEGATIVE_SLOPE)
+        if activation {
+            leaky_relu(x, NEGATIVE_SLOPE)
+        } else {
+            x
+        }
     }
 }
 
 #[derive(Module, Debug)]
 pub struct GeneratorConvBlock<B: Backend> {
     conv: Conv2d<B>,
-    norm: InstanceNorm<B>,
+    norm: GroupNorm<B>,
 }
 
 #[derive(Config, Debug)]
@@ -125,6 +115,8 @@ pub struct GeneratorConvBlockConfig {
     in_channels: usize,
     out_channels: usize,
     stride: usize,
+    #[config(default = 8)]
+    groups: usize,
 }
 
 impl GeneratorConvBlockConfig {
@@ -134,14 +126,14 @@ impl GeneratorConvBlockConfig {
         GeneratorConvBlock {
             conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
                 .with_stride([self.stride, self.stride])
-                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
                 .with_bias(false) // before InstanceNorm
                 .with_initializer(Initializer::KaimingNormal {
                     gain: leaky_gain,
                     fan_out_only: false,
                 })
                 .init(device),
-            norm: InstanceNormConfig::new(self.out_channels).init(device),
+            norm: GroupNormConfig::new(self.groups, self.out_channels).init(device),
         }
     }
 }
@@ -157,13 +149,15 @@ impl<B: Backend> GeneratorConvBlock<B> {
 #[derive(Module, Debug)]
 pub struct GeneratorDeconvBlock<B: Backend> {
     conv: Conv2d<B>,
-    norm: InstanceNorm<B>,
+    norm: GroupNorm<B>,
 }
 
 #[derive(Config, Debug)]
 pub struct GeneratorDeconvBlockConfig {
     in_channels: usize,
     out_channels: usize,
+    #[config(default = 8)]
+    groups: usize,
 }
 
 impl GeneratorDeconvBlockConfig {
@@ -172,14 +166,14 @@ impl GeneratorDeconvBlockConfig {
 
         GeneratorDeconvBlock {
             conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
-                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
                 .with_bias(false) // before InstanceNorm
                 .with_initializer(Initializer::KaimingNormal {
                     gain: leaky_gain,
                     fan_out_only: false,
                 })
                 .init(device),
-            norm: InstanceNormConfig::new(self.out_channels).init(device),
+            norm: GroupNormConfig::new(self.groups, self.out_channels).init(device),
         }
     }
 }
@@ -232,7 +226,7 @@ impl GeneratorConfig {
             dec2: GeneratorDeconvBlockConfig::new(c * 4, c).init(device),
             dec3: GeneratorDeconvBlockConfig::new(c * 2, c).init(device),
             final_conv: Conv2dConfig::new([c, CHANNELS], [3, 3])
-                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
                 .with_bias(true)
                 .with_initializer(Initializer::XavierUniform { gain: 1.0 })
                 .init(device),
@@ -241,6 +235,15 @@ impl GeneratorConfig {
 }
 
 impl<B: Backend> Generator<B> {
+    fn attention_layer(&self, query: Tensor<B, 4>, context: Tensor<B, 4>) -> Tensor<B, 4> {
+        let [b, c, h, w] = query.dims();
+        let num_heads = c / 64;
+        let prep = |t: Tensor<B, 4>| t.reshape([b, num_heads, 64, h * w]).swap_dims(2, 3);
+        let out = attention(prep(query), prep(context.clone()), prep(context), None);
+
+        out.swap_dims(2, 3).reshape([b, c, h, w])
+    }
+
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let s1 = self.enc1.forward(input);
         let s2 = self.enc2.forward(s1.clone());
@@ -248,15 +251,15 @@ impl<B: Backend> Generator<B> {
         let s4 = self.enc4.forward(s3.clone());
 
         let x = self.dec4.forward(s4);
-        let x = FlashAttentionV3::forward(x, s3.clone(), s3.clone(), None, false);
+        let x = self.attention_layer(x, s3.clone());
         let x = Tensor::cat(vec![x, s3], 1);
 
         let x = self.dec1.forward(x);
-        let x = FlashAttentionV3::forward(x, s2.clone(), s2.clone(), None, false);
+        let x = self.attention_layer(x, s2.clone());
         let x = Tensor::cat(vec![x, s2], 1);
 
         let x = self.dec2.forward(x);
-        let x = FlashAttentionV3::forward(x, s1.clone(), s1.clone(), None, false);
+        let x = self.attention_layer(x, s1.clone());
         let x = Tensor::cat(vec![x, s1], 1);
 
         let x = self.dec3.forward(x);
@@ -277,18 +280,10 @@ impl DiscriminatorConfig {
 
         Discriminator {
             noise: GaussianNoiseConfig::new(0.2).init(),
-            conv1: DiscriminatorBlockConfig::new(CHANNELS, c, 2, false).init(device),
-            conv2: DiscriminatorBlockConfig::new(c, c * 2, 2, true).init(device),
-            conv3: DiscriminatorBlockConfig::new(c * 2, c * 4, 2, true).init(device),
-            final_conv: Conv2dConfig::new([c * 4, 1], [3, 3])
-                .with_padding(PaddingConfig2d::Explicit(1, 1))
-                .with_bias(true)
-                .with_initializer(Initializer::KaimingNormal {
-                    gain: 1.0,
-                    fan_out_only: false,
-                })
-                .init(device),
-            final_u: Tensor::<B, 2>::random([1, 1], Distribution::Default, device),
+            conv1: DiscriminatorBlockConfig::new(CHANNELS, c, 2).init(device),
+            conv2: DiscriminatorBlockConfig::new(c, c * 2, 2).init(device),
+            conv3: DiscriminatorBlockConfig::new(c * 2, c * 4, 2).init(device),
+            final_block: DiscriminatorBlockConfig::new(c * 4, 1, 1).init(device),
         }
     }
 }
@@ -299,32 +294,18 @@ pub struct Discriminator<B: Backend> {
     pub conv1: DiscriminatorBlock<B>,
     pub conv2: DiscriminatorBlock<B>,
     pub conv3: DiscriminatorBlock<B>,
-    pub final_conv: Conv2d<B>,
-    pub final_u: Tensor<B, 2>,
+    pub final_block: DiscriminatorBlock<B>,
 }
 
 impl<B: Backend> Discriminator<B> {
     pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 2> {
         let x = self.noise.forward(images);
 
-        let x = self.conv1.forward(x);
-        let x = self.conv2.forward(x);
-        let x = self.conv3.forward(x);
+        let x = self.conv1.forward(x, true);
+        let x = self.conv2.forward(x, true);
+        let x = self.conv3.forward(x, true);
 
-        let (sn_weight, _u_final) =
-            spectral_norm(self.final_conv.weight.val(), &self.final_u.clone());
-
-        let x = conv2d(
-            x,
-            sn_weight,
-            self.final_conv.bias.as_ref().map(|b| b.val()),
-            ConvOptions::new(
-                self.final_conv.stride,
-                [1, 1],
-                self.final_conv.dilation,
-                self.final_conv.groups,
-            ),
-        );
+        let x = self.final_block.forward(x, false);
 
         x.mean_dims(&[2, 3]).squeeze_dims(&[2, 3])
     }
@@ -332,7 +313,7 @@ impl<B: Backend> Discriminator<B> {
 
 #[derive(Config, Debug)]
 pub struct NetworkConfig {
-    #[config(default = 128)]
+    #[config(default = 64)]
     pub hidden_channels: usize,
 }
 
