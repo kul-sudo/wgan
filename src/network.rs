@@ -26,15 +26,15 @@ fn spectral_norm<B: Backend>(
 ) -> (Tensor<B, 4>, Tensor<B, 2>) {
     let [oc, ic, kh, kw] = weight.dims();
     let w_mat = weight.clone().reshape([oc, ic * kh * kw]);
-    let v = vector_normalize(u.clone().matmul(w_mat.clone()), Norm::L2, 1, 1e-8);
+    let v = vector_normalize(u.clone().matmul(w_mat.clone()), Norm::L2, 1, 1e-5);
     let u_new = vector_normalize(
         v.clone().matmul(w_mat.clone().transpose()),
         Norm::L2,
         1,
-        1e-8,
+        1e-5,
     );
     let sigma = u_new.clone().matmul(w_mat).matmul(v.transpose());
-    let weight_sn = weight.div(sigma.reshape([1, 1, 1, 1]).add_scalar(1e-8));
+    let weight_sn = weight.div(sigma.reshape([1, 1, 1, 1]).add_scalar(1e-5));
 
     (weight_sn, u_new.detach())
 }
@@ -237,8 +237,14 @@ impl GeneratorConfig {
 impl<B: Backend> Generator<B> {
     fn attention_layer(&self, query: Tensor<B, 4>, context: Tensor<B, 4>) -> Tensor<B, 4> {
         let [b, c, h, w] = query.dims();
-        let num_heads = c / 64;
-        let prep = |t: Tensor<B, 4>| t.reshape([b, num_heads, 64, h * w]).swap_dims(2, 3);
+
+        let d_k = 16;
+        let num_heads = c / d_k;
+
+        assert_eq!(c % d_k, 0);
+
+        let prep = |t: Tensor<B, 4>| t.reshape([b, num_heads, d_k, h * w]).swap_dims(2, 3);
+
         let out = attention(prep(query), prep(context.clone()), prep(context), None);
 
         out.swap_dims(2, 3).reshape([b, c, h, w])
@@ -255,11 +261,11 @@ impl<B: Backend> Generator<B> {
         let x = Tensor::cat(vec![x, s3], 1);
 
         let x = self.dec1.forward(x);
-        let x = self.attention_layer(x, s2.clone());
+        // let x = self.attention_layer(x, s2.clone());
         let x = Tensor::cat(vec![x, s2], 1);
 
         let x = self.dec2.forward(x);
-        let x = self.attention_layer(x, s1.clone());
+        // let x = self.attention_layer(x, s1.clone());
         let x = Tensor::cat(vec![x, s1], 1);
 
         let x = self.dec3.forward(x);
