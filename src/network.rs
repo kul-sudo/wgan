@@ -4,7 +4,7 @@ use burn::{
     config::Config,
     module::{Initializer, Module, RunningState},
     nn::{
-        GaussianNoise, GaussianNoiseConfig, GroupNorm, GroupNormConfig, PaddingConfig2d,
+        GaussianNoise, GaussianNoiseConfig, InstanceNorm, InstanceNormConfig, PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},
     },
     tensor::{
@@ -107,7 +107,7 @@ impl<B: Backend> DiscriminatorBlock<B> {
 #[derive(Module, Debug)]
 pub struct GeneratorConvBlock<B: Backend> {
     conv: Conv2d<B>,
-    norm: GroupNorm<B>,
+    norm: InstanceNorm<B>,
 }
 
 #[derive(Config, Debug)]
@@ -115,8 +115,6 @@ pub struct GeneratorConvBlockConfig {
     in_channels: usize,
     out_channels: usize,
     stride: usize,
-    #[config(default = 8)]
-    groups: usize,
 }
 
 impl GeneratorConvBlockConfig {
@@ -133,7 +131,7 @@ impl GeneratorConvBlockConfig {
                     fan_out_only: false,
                 })
                 .init(device),
-            norm: GroupNormConfig::new(self.groups, self.out_channels).init(device),
+            norm: InstanceNormConfig::new(self.out_channels).init(device),
         }
     }
 }
@@ -149,15 +147,13 @@ impl<B: Backend> GeneratorConvBlock<B> {
 #[derive(Module, Debug)]
 pub struct GeneratorDeconvBlock<B: Backend> {
     conv: Conv2d<B>,
-    norm: GroupNorm<B>,
+    norm: InstanceNorm<B>,
 }
 
 #[derive(Config, Debug)]
 pub struct GeneratorDeconvBlockConfig {
     in_channels: usize,
     out_channels: usize,
-    #[config(default = 8)]
-    groups: usize,
 }
 
 impl GeneratorDeconvBlockConfig {
@@ -173,7 +169,7 @@ impl GeneratorDeconvBlockConfig {
                     fan_out_only: false,
                 })
                 .init(device),
-            norm: GroupNormConfig::new(self.groups, self.out_channels).init(device),
+            norm: InstanceNormConfig::new(self.out_channels).init(device),
         }
     }
 }
@@ -235,17 +231,17 @@ impl GeneratorConfig {
 }
 
 impl<B: Backend> Generator<B> {
-    fn attention_layer(&self, query: Tensor<B, 4>, context: Tensor<B, 4>) -> Tensor<B, 4> {
+    fn attention(&self, query: Tensor<B, 4>, context: Tensor<B, 4>) -> Tensor<B, 4> {
         let [b, c, h, w] = query.dims();
-
-        let d_k = 16;
+        let d_k = 32;
         let num_heads = c / d_k;
 
-        assert_eq!(c % d_k, 0);
-
         let prep = |t: Tensor<B, 4>| t.reshape([b, num_heads, d_k, h * w]).swap_dims(2, 3);
+        let scaling = (d_k as f32).sqrt().recip();
+        let q = prep(query).mul_scalar(scaling);
+        let c_prepped = prep(context);
 
-        let out = attention(prep(query), prep(context.clone()), prep(context), None);
+        let out = attention(q, c_prepped.clone(), c_prepped, None);
 
         out.swap_dims(2, 3).reshape([b, c, h, w])
     }
@@ -257,15 +253,14 @@ impl<B: Backend> Generator<B> {
         let s4 = self.enc4.forward(s3.clone());
 
         let x = self.dec4.forward(s4);
-        let x = self.attention_layer(x, s3.clone());
+        let x = self.attention(x, s3.clone());
         let x = Tensor::cat(vec![x, s3], 1);
 
         let x = self.dec1.forward(x);
-        // let x = self.attention_layer(x, s2.clone());
+        let x = self.attention(x, s2.clone());
         let x = Tensor::cat(vec![x, s2], 1);
 
         let x = self.dec2.forward(x);
-        // let x = self.attention_layer(x, s1.clone());
         let x = Tensor::cat(vec![x, s1], 1);
 
         let x = self.dec3.forward(x);
@@ -304,16 +299,14 @@ pub struct Discriminator<B: Backend> {
 }
 
 impl<B: Backend> Discriminator<B> {
-    pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 2> {
+    pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.noise.forward(images);
 
         let x = self.conv1.forward(x, true);
         let x = self.conv2.forward(x, true);
         let x = self.conv3.forward(x, true);
 
-        let x = self.final_block.forward(x, false);
-
-        x.mean_dims(&[2, 3]).squeeze_dims(&[2, 3])
+        self.final_block.forward(x, false)
     }
 }
 

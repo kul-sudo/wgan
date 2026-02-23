@@ -5,7 +5,6 @@ use burn::{
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
     module::Module,
-    nn::loss::{MseLoss, Reduction},
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
@@ -26,19 +25,19 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
-    #[config(default = 1e-4)]
+    #[config(default = 4e-4)]
     pub discriminator_lr: f64,
     #[config(default = 1e-4)]
     pub generator_lr: f64,
-    #[config(default = 5)]
+    #[config(default = 1)]
     pub num_critic: usize,
-    #[config(default = 10.0)]
+    #[config(default = 0.5)]
     pub lambda_adv: f32,
     #[config(default = 20.0)]
     pub lambda_l1: f32,
-    #[config(default = 200.0)]
+    #[config(default = 40.0)]
     pub lambda_perceptual: f32,
-    #[config(default = 10.0)]
+    #[config(default = 4.0)]
     pub lambda_sobel: f32,
 }
 
@@ -112,7 +111,6 @@ fn save_samples<B: Backend>(
 pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     create_dir_all(ARTIFACT_DIR).unwrap();
 
-    let mse_loss = MseLoss::new();
     let optimizer_config = AdamConfig::new()
         .with_beta_1(0.0)
         .with_beta_2(0.9)
@@ -137,16 +135,16 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
     for epoch in 0..config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
-            let fake_images = generator.forward(batch.edited.clone()).detach();
+            let reconstructed = generator.forward(batch.edited.clone());
             for i in 0..config.num_critic {
-                let score_fake = discriminator.forward(fake_images.clone());
+                let score_fake = discriminator.forward(reconstructed.clone().detach());
                 let score_real = discriminator.forward(batch.original.clone());
 
                 let loss_d = score_fake.mean() - score_real.mean();
 
-                if loss_d.clone().contains_nan().into_scalar().to_bool() {
-                    panic!("NaN in Loss D! SN might need higher epsilon if using f16.");
-                }
+                // if loss_d.clone().contains_nan().into_scalar().to_bool() {
+                //     panic!("NaN in Loss D! SN might need higher epsilon if using f16.");
+                // }
 
                 if iteration % 10 == 0 && i == 0 {
                     let d_val: f32 = loss_d.clone().into_scalar().to_f32();
@@ -158,21 +156,11 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
                 discriminator = optimizer_d.step(config.discriminator_lr, discriminator, grads);
             }
 
-            let reconstructed = generator.forward(batch.edited.clone());
-
-            if reconstructed.clone().contains_nan().into_scalar().to_bool() {
-                panic!("Grave Error: Generator produced NaNs in the image pixels!");
-            }
+            // if reconstructed.clone().contains_nan().into_scalar().to_bool() {
+            //     panic!("Grave Error: Generator produced NaNs in the image pixels!");
+            // }
 
             let score_reconstructed = discriminator.forward(reconstructed.clone());
-            if score_reconstructed
-                .clone()
-                .contains_nan()
-                .into_scalar()
-                .to_bool()
-            {
-                panic!("Grave Error: Discriminator Score is NaN! Check Gradient Penalty.");
-            }
             let loss_adv = -score_reconstructed.mean();
 
             let loss_l1 = (reconstructed.clone() - batch.original.clone())
@@ -182,9 +170,9 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
             let (f_real1, f_real2, f_real3) = perceptual_net.forward(batch.original.clone());
             let (f_fake1, f_fake2, f_fake3) = perceptual_net.forward(reconstructed.clone());
 
-            let loss_perceptual = mse_loss.forward(f_fake1, f_real1.detach(), Reduction::Mean)
-                + mse_loss.forward(f_fake2, f_real2.detach(), Reduction::Mean)
-                + mse_loss.forward(f_fake3, f_real3.detach(), Reduction::Mean);
+            let loss_perceptual = ((f_fake1 - f_real1.detach()).abs().mean())
+                + ((f_fake2 - f_real2.detach()).abs().mean())
+                + ((f_fake3 - f_real3.detach()).abs().mean());
 
             let edges_real = sobel(batch.original.clone(), &device);
             let edges_fake = sobel(reconstructed.clone(), &device);
@@ -195,12 +183,12 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
                 + (loss_perceptual.clone() * config.lambda_perceptual)
                 + (loss_sobel.clone() * config.lambda_sobel);
 
-            if loss_g.clone().contains_nan().into_scalar().to_bool() {
-                panic!(
-                    "NaN detected in Loss G! Iteration: {}, Epoch: {}",
-                    iteration, epoch
-                );
-            }
+            // if loss_g.clone().contains_nan().into_scalar().to_bool() {
+            //     panic!(
+            //         "NaN detected in Loss G! Iteration: {}, Epoch: {}",
+            //         iteration, epoch
+            //     );
+            // }
 
             println!(
                 "{:.2} {:.2} {:.2} {:.2}",
