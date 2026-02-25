@@ -8,7 +8,9 @@ use burn::{
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
-    tensor::{Tensor, backend::AutodiffBackend, module::conv2d, ops::ConvOptions},
+    tensor::{
+        Tensor, activation::relu, backend::AutodiffBackend, module::conv2d, ops::ConvOptions,
+    },
 };
 use image::{GrayImage, Luma};
 use std::fs::create_dir_all;
@@ -25,7 +27,7 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
-    #[config(default = 1e-4)]
+    #[config(default = 4e-4)]
     pub discriminator_lr: f64,
     #[config(default = 1e-4)]
     pub generator_lr: f64,
@@ -135,30 +137,20 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
     for epoch in 0..config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
-            let reconstructed = generator.forward(batch.edited.clone());
-            for i in 0..config.num_critic {
-                let score_fake = discriminator.forward(reconstructed.clone().detach());
+            let fake = generator.forward(batch.edited.clone()).detach();
+
+            for _ in 0..config.num_critic {
+                let score_fake = discriminator.forward(fake.clone());
                 let score_real = discriminator.forward(batch.original.clone());
 
-                let loss_d = score_fake.mean() - score_real.mean();
-
-                // if loss_d.clone().contains_nan().into_scalar().to_bool() {
-                //     panic!("NaN in Loss D! SN might need higher epsilon if using f16.");
-                // }
-
-                if iteration % 10 == 0 && i == 0 {
-                    let d_val: f32 = loss_d.clone().into_scalar().to_f32();
-                    println!("[Epoch {}][Iter {}] Loss D: {:.4}", epoch, iteration, d_val);
-                }
+                let loss_d = relu(1.0 + score_fake).mean() + relu(1.0 - score_real).mean();
 
                 let grads = loss_d.backward();
                 let grads = GradientsParams::from_grads(grads, &discriminator);
                 discriminator = optimizer_d.step(config.discriminator_lr, discriminator, grads);
             }
 
-            // if reconstructed.clone().contains_nan().into_scalar().to_bool() {
-            //     panic!("Grave Error: Generator produced NaNs in the image pixels!");
-            // }
+            let reconstructed = generator.forward(batch.edited.clone());
 
             let score_reconstructed = discriminator.forward(reconstructed.clone());
             let loss_adv = -score_reconstructed.mean();
@@ -167,12 +159,15 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
                 .abs()
                 .mean();
 
-            let (f_real1, f_real2, f_real3) = perceptual_net.forward(batch.original.clone());
-            let (f_fake1, f_fake2, f_fake3) = perceptual_net.forward(reconstructed.clone());
+            let p_real = (batch.original.clone() + 1.0).mul_scalar(0.5);
+            let p_fake = (reconstructed.clone() + 1.0).mul_scalar(0.5);
 
-            let loss_perceptual = ((f_fake1 - f_real1.detach()).abs().mean())
-                + ((f_fake2 - f_real2.detach()).abs().mean())
-                + ((f_fake3 - f_real3.detach()).abs().mean());
+            let (f_real1, f_real2, f_real3) = perceptual_net.forward(p_real);
+            let (f_fake1, f_fake2, f_fake3) = perceptual_net.forward(p_fake);
+
+            let loss_perceptual = (f_fake1 - f_real1.detach()).abs().mean()
+                + (f_fake2 - f_real2.detach()).abs().mean()
+                + (f_fake3 - f_real3.detach()).abs().mean();
 
             let edges_real = sobel(batch.original.clone(), &device);
             let edges_fake = sobel(reconstructed.clone(), &device);
@@ -183,31 +178,21 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
                 + (loss_perceptual.clone() * config.lambda_perceptual)
                 + (loss_sobel.clone() * config.lambda_sobel);
 
-            // if loss_g.clone().contains_nan().into_scalar().to_bool() {
-            //     panic!(
-            //         "NaN detected in Loss G! Iteration: {}, Epoch: {}",
-            //         iteration, epoch
-            //     );
-            // }
-
-            println!(
-                "{:.2} {:.2} {:.2} {:.2}",
-                (loss_adv.into_scalar().to_f32() * config.lambda_adv),
-                (loss_l1.into_scalar().to_f32() * config.lambda_l1),
-                (loss_perceptual.into_scalar().to_f32() * config.lambda_perceptual),
-                (loss_sobel.into_scalar().to_f32() * config.lambda_sobel)
-            );
-
-            {
-                let grads = loss_g.backward();
-                let grads = GradientsParams::from_grads(grads, &generator);
-                generator = optimizer_g.step(config.generator_lr, generator, grads);
-            }
-
             if iteration % 10 == 0 {
-                println!("Loss G: {}", loss_g.clone().into_scalar().to_f32());
-                println!("Epoch: {}", epoch);
+                println!(
+                    "Epoch: {} Adv: {:.2} L1: {:.2} Perceptual: {:.2} Sobel: {:.2} Total G: {:.4}",
+                    epoch,
+                    (loss_adv.clone().into_scalar().to_f32() * config.lambda_adv),
+                    (loss_l1.clone().into_scalar().to_f32() * config.lambda_l1),
+                    (loss_perceptual.clone().into_scalar().to_f32() * config.lambda_perceptual),
+                    (loss_sobel.clone().into_scalar().to_f32() * config.lambda_sobel),
+                    loss_g.clone().into_scalar().to_f32()
+                );
             }
+
+            let grads = loss_g.backward();
+            let grads = GradientsParams::from_grads(grads, &generator);
+            generator = optimizer_g.step(config.generator_lr, generator, grads);
 
             if iteration % 100 == 0 {
                 save_samples(

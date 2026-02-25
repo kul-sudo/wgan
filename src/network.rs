@@ -7,6 +7,7 @@ use burn::{
         GaussianNoise, GaussianNoiseConfig, InstanceNorm, InstanceNormConfig, PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},
     },
+    prelude::ToElement,
     tensor::{
         Distribution, Tensor,
         activation::{leaky_relu, tanh},
@@ -83,7 +84,7 @@ impl DiscriminatorBlockConfig {
                 .init(device),
             u: RunningState::new(Tensor::<B, 2>::random(
                 [1, self.out_channels],
-                Distribution::Default,
+                Distribution::Normal(0.0, 1.0),
                 device,
             )),
             v: RunningState::new(Tensor::<B, 2>::random(
@@ -101,7 +102,7 @@ impl<B: Backend> DiscriminatorBlock<B> {
         let u_current = self.u.value();
         let v_current = self.v.value();
 
-        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 1, 1e-12);
+        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 1, 1e-8);
 
         self.u.update(u_next);
         self.v.update(v_next);
@@ -130,6 +131,8 @@ impl<B: Backend> DiscriminatorBlock<B> {
 pub struct GeneratorConvBlock<B: Backend> {
     conv: Conv2d<B>,
     norm: InstanceNorm<B>,
+    u: RunningState<Tensor<B, 2>>,
+    v: RunningState<Tensor<B, 2>>,
 }
 
 #[derive(Config, Debug)]
@@ -154,13 +157,44 @@ impl GeneratorConvBlockConfig {
                 })
                 .init(device),
             norm: InstanceNormConfig::new(self.out_channels).init(device),
+            u: RunningState::new(Tensor::<B, 2>::random(
+                [1, self.out_channels],
+                Distribution::Normal(0.0, 1.0),
+                device,
+            )),
+            v: RunningState::new(Tensor::<B, 2>::random(
+                [1, self.in_channels * 3 * 3],
+                Distribution::Normal(0.0, 1.0),
+                device,
+            )),
         }
     }
 }
 
 impl<B: Backend> GeneratorConvBlock<B> {
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
-        let x = self.conv.forward(input);
+        let (sn_weight, u_next, v_next) = spectral_norm(
+            self.conv.weight.val(),
+            self.u.value(),
+            self.v.value(),
+            1,
+            1e-8,
+        );
+        self.u.update(u_next);
+        self.v.update(v_next);
+
+        let x = conv2d(
+            input,
+            sn_weight,
+            None,
+            ConvOptions::new(
+                self.conv.stride,
+                [1, 1],
+                self.conv.dilation,
+                self.conv.groups,
+            ),
+        );
+
         let x = self.norm.forward(x);
         leaky_relu(x, NEGATIVE_SLOPE)
     }
@@ -170,6 +204,8 @@ impl<B: Backend> GeneratorConvBlock<B> {
 pub struct GeneratorDeconvBlock<B: Backend> {
     conv: Conv2d<B>,
     norm: InstanceNorm<B>,
+    u: RunningState<Tensor<B, 2>>,
+    v: RunningState<Tensor<B, 2>>,
 }
 
 #[derive(Config, Debug)]
@@ -192,6 +228,16 @@ impl GeneratorDeconvBlockConfig {
                 })
                 .init(device),
             norm: InstanceNormConfig::new(self.out_channels).init(device),
+            u: RunningState::new(Tensor::<B, 2>::random(
+                [1, self.out_channels],
+                Distribution::Normal(0.0, 1.0),
+                device,
+            )),
+            v: RunningState::new(Tensor::<B, 2>::random(
+                [1, self.in_channels * 3 * 3],
+                Distribution::Normal(0.0, 1.0),
+                device,
+            )),
         }
     }
 }
@@ -199,14 +245,33 @@ impl GeneratorDeconvBlockConfig {
 impl<B: Backend> GeneratorDeconvBlock<B> {
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let [_batch, _channels, h, w] = input.dims();
-
         let x = interpolate(
             input,
             [h * 2, w * 2],
             InterpolateOptions::new(InterpolateMode::Nearest),
         );
 
-        let x = self.conv.forward(x);
+        let (sn_weight, u_next, v_next) = spectral_norm(
+            self.conv.weight.val(),
+            self.u.value(),
+            self.v.value(),
+            1,
+            1e-8,
+        );
+        self.u.update(u_next);
+        self.v.update(v_next);
+
+        let x = conv2d(
+            x,
+            sn_weight,
+            None,
+            ConvOptions::new(
+                self.conv.stride,
+                [1, 1],
+                self.conv.dilation,
+                self.conv.groups,
+            ),
+        );
         let x = self.norm.forward(x);
         leaky_relu(x, NEGATIVE_SLOPE)
     }
@@ -253,21 +318,6 @@ impl GeneratorConfig {
 }
 
 impl<B: Backend> Generator<B> {
-    fn attention(&self, query: Tensor<B, 4>, context: Tensor<B, 4>) -> Tensor<B, 4> {
-        let [b, c, h, w] = query.dims();
-        let d_k = 32;
-        let num_heads = c / d_k;
-
-        let prep = |t: Tensor<B, 4>| t.reshape([b, num_heads, d_k, h * w]).swap_dims(2, 3);
-        let scaling = (d_k as f32).sqrt().recip();
-        let q = prep(query).mul_scalar(scaling);
-        let c_prepped = prep(context);
-
-        let out = attention(q, c_prepped.clone(), c_prepped, None);
-
-        out.swap_dims(2, 3).reshape([b, c, h, w])
-    }
-
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let s1 = self.enc1.forward(input);
         let s2 = self.enc2.forward(s1.clone());
@@ -275,11 +325,9 @@ impl<B: Backend> Generator<B> {
         let s4 = self.enc4.forward(s3.clone());
 
         let x = self.dec4.forward(s4);
-        let x = self.attention(x, s3.clone());
         let x = Tensor::cat(vec![x, s3], 1);
 
         let x = self.dec1.forward(x);
-        let x = self.attention(x, s2.clone());
         let x = Tensor::cat(vec![x, s2], 1);
 
         let x = self.dec2.forward(x);
