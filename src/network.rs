@@ -13,8 +13,7 @@ use burn::{
         backend::Backend,
         linalg::{Norm, vector_normalize},
         module::{attention, conv2d, interpolate},
-        ops::ConvOptions,
-        ops::{InterpolateMode, InterpolateOptions},
+        ops::{ConvOptions, InterpolateMode, InterpolateOptions},
     },
 };
 
@@ -22,27 +21,43 @@ const NEGATIVE_SLOPE: f64 = 0.2;
 
 fn spectral_norm<B: Backend>(
     weight: Tensor<B, 4>,
-    u: &Tensor<B, 2>,
-) -> (Tensor<B, 4>, Tensor<B, 2>) {
+    u: Tensor<B, 2>,
+    v: Tensor<B, 2>,
+    n_power_iterations: usize,
+    eps: f64,
+) -> (Tensor<B, 4>, Tensor<B, 2>, Tensor<B, 2>) {
     let [oc, ic, kh, kw] = weight.dims();
-    let w_mat = weight.clone().reshape([oc, ic * kh * kw]);
-    let v = vector_normalize(u.clone().matmul(w_mat.clone()), Norm::L2, 1, 1e-5);
-    let u_new = vector_normalize(
-        v.clone().matmul(w_mat.clone().transpose()),
-        Norm::L2,
-        1,
-        1e-5,
-    );
-    let sigma = u_new.clone().matmul(w_mat).matmul(v.transpose());
-    let weight_sn = weight.div(sigma.reshape([1, 1, 1, 1]).add_scalar(1e-5));
+    let weight_mat = weight.clone().reshape([oc, ic * kh * kw]);
 
-    (weight_sn, u_new.detach())
+    let mut u_vec = u;
+    let mut v_vec = v;
+
+    for _ in 0..n_power_iterations {
+        v_vec = vector_normalize(u_vec.clone().matmul(weight_mat.clone()), Norm::L2, 1, eps);
+        u_vec = vector_normalize(
+            v_vec.clone().matmul(weight_mat.clone().transpose()),
+            Norm::L2,
+            1,
+            eps,
+        );
+    }
+
+    let sigma = u_vec
+        .clone()
+        .matmul(weight_mat)
+        .matmul(v_vec.clone().transpose())
+        .detach();
+
+    let normalized_weight = weight.div(sigma.reshape([1, 1, 1, 1]).add_scalar(eps));
+
+    (normalized_weight, u_vec.detach(), v_vec.detach())
 }
 
 #[derive(Module, Debug)]
 pub struct DiscriminatorBlock<B: Backend> {
     conv: Conv2d<B>,
     u: RunningState<Tensor<B, 2>>,
+    v: RunningState<Tensor<B, 2>>,
 }
 
 #[derive(Config, Debug)]
@@ -71,6 +86,11 @@ impl DiscriminatorBlockConfig {
                 Distribution::Default,
                 device,
             )),
+            v: RunningState::new(Tensor::<B, 2>::random(
+                [1, self.in_channels * 3 * 3],
+                Distribution::Normal(0.0, 1.0),
+                device,
+            )),
         }
     }
 }
@@ -79,10 +99,12 @@ impl<B: Backend> DiscriminatorBlock<B> {
     pub fn forward(&self, input: Tensor<B, 4>, activation: bool) -> Tensor<B, 4> {
         let weight = self.conv.weight.val();
         let u_current = self.u.value();
+        let v_current = self.v.value();
 
-        let (sn_weight, u_next) = spectral_norm(weight, &u_current);
+        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 1, 1e-12);
 
         self.u.update(u_next);
+        self.v.update(v_next);
 
         let x = conv2d(
             input,

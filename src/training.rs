@@ -25,17 +25,17 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
-    #[config(default = 4e-4)]
+    #[config(default = 1e-4)]
     pub discriminator_lr: f64,
     #[config(default = 1e-4)]
     pub generator_lr: f64,
     #[config(default = 1)]
     pub num_critic: usize,
-    #[config(default = 0.5)]
+    #[config(default = 1.5)]
     pub lambda_adv: f32,
-    #[config(default = 20.0)]
+    #[config(default = 10.0)]
     pub lambda_l1: f32,
-    #[config(default = 40.0)]
+    #[config(default = 10.0)]
     pub lambda_perceptual: f32,
     #[config(default = 4.0)]
     pub lambda_sobel: f32,
