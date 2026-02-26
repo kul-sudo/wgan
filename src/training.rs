@@ -4,6 +4,7 @@ use crate::network::NetworkConfig;
 use burn::{
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
+    grad_clipping::GradientClippingConfig,
     module::Module,
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
@@ -33,11 +34,11 @@ pub struct TrainingConfig {
     pub generator_lr: f64,
     #[config(default = 1)]
     pub num_critic: usize,
-    #[config(default = 1.5)]
+    #[config(default = 20.0)]
     pub lambda_adv: f32,
-    #[config(default = 10.0)]
+    #[config(default = 20.0)]
     pub lambda_l1: f32,
-    #[config(default = 10.0)]
+    #[config(default = 20.0)]
     pub lambda_perceptual: f32,
     #[config(default = 4.0)]
     pub lambda_sobel: f32,
@@ -116,6 +117,7 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     let optimizer_config = AdamConfig::new()
         .with_beta_1(0.0)
         .with_beta_2(0.9)
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .with_weight_decay(None);
     let config = TrainingConfig::new(NetworkConfig::new(), optimizer_config);
 
@@ -137,7 +139,8 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
     for epoch in 0..config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
-            let fake = generator.forward(batch.edited.clone()).detach();
+            let reconstructed = generator.forward(batch.edited.clone());
+            let fake = reconstructed.clone().detach();
 
             for _ in 0..config.num_critic {
                 let score_fake = discriminator.forward(fake.clone());
@@ -150,8 +153,6 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
                 discriminator = optimizer_d.step(config.discriminator_lr, discriminator, grads);
             }
 
-            let reconstructed = generator.forward(batch.edited.clone());
-
             let score_reconstructed = discriminator.forward(reconstructed.clone());
             let loss_adv = -score_reconstructed.mean();
 
@@ -159,11 +160,8 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
                 .abs()
                 .mean();
 
-            let p_real = (batch.original.clone() + 1.0).mul_scalar(0.5);
-            let p_fake = (reconstructed.clone() + 1.0).mul_scalar(0.5);
-
-            let (f_real1, f_real2, f_real3) = perceptual_net.forward(p_real);
-            let (f_fake1, f_fake2, f_fake3) = perceptual_net.forward(p_fake);
+            let (f_real1, f_real2, f_real3) = perceptual_net.forward(batch.original.clone());
+            let (f_fake1, f_fake2, f_fake3) = perceptual_net.forward(reconstructed.clone());
 
             let loss_perceptual = (f_fake1 - f_real1.detach()).abs().mean()
                 + (f_fake2 - f_real2.detach()).abs().mean()

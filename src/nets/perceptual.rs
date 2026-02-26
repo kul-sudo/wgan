@@ -25,7 +25,7 @@ impl PerceptualNetConfig {
 
         PerceptualNet {
             conv1: Conv2dConfig::new([self.in_channels, h], [3, 3])
-                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_initializer(Initializer::KaimingNormal {
                     gain: leaky_gain,
                     fan_out_only: false,
@@ -34,7 +34,7 @@ impl PerceptualNetConfig {
             norm1: InstanceNormConfig::new(h).init(device),
             conv2: Conv2dConfig::new([h, h * 2], [3, 3])
                 .with_stride([2, 2])
-                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_initializer(Initializer::KaimingNormal {
                     gain: leaky_gain,
                     fan_out_only: false,
@@ -43,7 +43,7 @@ impl PerceptualNetConfig {
             norm2: InstanceNormConfig::new(h * 2).init(device),
             conv3: Conv2dConfig::new([h * 2, h * 4], [3, 3])
                 .with_stride([2, 2])
-                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_initializer(Initializer::KaimingNormal {
                     gain: 1.0,
                     fan_out_only: false,

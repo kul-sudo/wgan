@@ -28,19 +28,20 @@ fn spectral_norm<B: Backend>(
     eps: f64,
 ) -> (Tensor<B, 4>, Tensor<B, 2>, Tensor<B, 2>) {
     let [oc, ic, kh, kw] = weight.dims();
-    let weight_mat = weight.clone().reshape([oc, ic * kh * kw]);
+    let weight_mat = weight.clone().detach().reshape([oc, ic * kh * kw]);
 
     let mut u_vec = u;
     let mut v_vec = v;
 
     for _ in 0..n_power_iterations {
-        v_vec = vector_normalize(u_vec.clone().matmul(weight_mat.clone()), Norm::L2, 1, eps);
+        v_vec = vector_normalize(u_vec.matmul(weight_mat.clone()), Norm::L2, 1, eps).detach();
         u_vec = vector_normalize(
             v_vec.clone().matmul(weight_mat.clone().transpose()),
             Norm::L2,
             1,
             eps,
-        );
+        )
+        .detach();
     }
 
     let sigma = u_vec
@@ -75,7 +76,7 @@ impl DiscriminatorBlockConfig {
         DiscriminatorBlock {
             conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
                 .with_stride([self.stride, self.stride])
-                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_bias(true)
                 .with_initializer(Initializer::KaimingNormal {
                     gain: leaky_gain,
@@ -149,7 +150,7 @@ impl GeneratorConvBlockConfig {
         GeneratorConvBlock {
             conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
                 .with_stride([self.stride, self.stride])
-                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_bias(false) // before InstanceNorm
                 .with_initializer(Initializer::KaimingNormal {
                     gain: leaky_gain,
@@ -177,9 +178,10 @@ impl<B: Backend> GeneratorConvBlock<B> {
             self.conv.weight.val(),
             self.u.value(),
             self.v.value(),
-            1,
+            2,
             1e-8,
         );
+
         self.u.update(u_next);
         self.v.update(v_next);
 
@@ -220,7 +222,7 @@ impl GeneratorDeconvBlockConfig {
 
         GeneratorDeconvBlock {
             conv: Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
-                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_bias(false) // before InstanceNorm
                 .with_initializer(Initializer::KaimingNormal {
                     gain: leaky_gain,
@@ -255,9 +257,10 @@ impl<B: Backend> GeneratorDeconvBlock<B> {
             self.conv.weight.val(),
             self.u.value(),
             self.v.value(),
-            1,
+            2,
             1e-8,
         );
+
         self.u.update(u_next);
         self.v.update(v_next);
 
@@ -309,7 +312,7 @@ impl GeneratorConfig {
             dec2: GeneratorDeconvBlockConfig::new(c * 4, c).init(device),
             dec3: GeneratorDeconvBlockConfig::new(c * 2, c).init(device),
             final_conv: Conv2dConfig::new([c, CHANNELS], [3, 3])
-                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_bias(true)
                 .with_initializer(Initializer::XavierUniform { gain: 1.0 })
                 .init(device),
