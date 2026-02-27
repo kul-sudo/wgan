@@ -1,10 +1,10 @@
+use crate::consts::ARTIFACT_DIR;
 use crate::dataset::ImageBatcher;
-use crate::files::ImagePair;
+use crate::files::{ImagePair, PIXEL_MID};
 use crate::network::NetworkConfig;
 use burn::{
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
-    grad_clipping::GradientClippingConfig,
     module::Module,
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
@@ -13,16 +13,14 @@ use burn::{
         Tensor, activation::relu, backend::AutodiffBackend, module::conv2d, ops::ConvOptions,
     },
 };
-use image::{GrayImage, Luma};
+use image::{GrayImage, imageops::replace};
 use std::fs::create_dir_all;
-
-const ARTIFACT_DIR: &str = "artifact";
 
 #[derive(Debug, Config)]
 pub struct TrainingConfig {
     pub model: NetworkConfig,
     pub optimizer: AdamConfig,
-    #[config(default = 500)]
+    #[config(default = 1000)]
     pub num_epochs: usize,
     #[config(default = 8)]
     pub batch_size: usize,
@@ -38,7 +36,7 @@ pub struct TrainingConfig {
     pub lambda_adv: f32,
     #[config(default = 20.0)]
     pub lambda_l1: f32,
-    #[config(default = 20.0)]
+    #[config(default = 25.0)]
     pub lambda_perceptual: f32,
     #[config(default = 4.0)]
     pub lambda_sobel: f32,
@@ -69,41 +67,28 @@ fn save_samples<B: Backend>(
     original_target: Tensor<B, 4>,
     reconstructed: Tensor<B, 4>,
 ) {
-    let [_batch_size, _channels, h, w] = original_target.dims();
+    let [_, _, h, w] = original_target.dims();
 
-    let input_vec = manual_input
-        .slice([0..1, 0..1])
-        .into_data()
-        .to_vec::<f32>()
-        .unwrap();
-    let target_vec = original_target
-        .slice([0..1, 0..1])
-        .into_data()
-        .to_vec::<f32>()
-        .unwrap();
-    let recon_vec = reconstructed
-        .slice([0..1, 0..1])
-        .into_data()
-        .to_vec::<f32>()
-        .unwrap();
+    let denorm = |t: Tensor<B, 4>| -> Vec<u8> {
+        t.slice([0..1, 0..1])
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(|v| ((v + 1.0) * PIXEL_MID).clamp(0.0, 255.0) as u8)
+            .collect()
+    };
+
+    let target_img = GrayImage::from_raw(w as u32, h as u32, denorm(original_target)).unwrap();
+    let input_img = GrayImage::from_raw(w as u32, h as u32, denorm(manual_input)).unwrap();
+    let reconstruction_img =
+        GrayImage::from_raw(w as u32, h as u32, denorm(reconstructed)).unwrap();
 
     let mut combined = GrayImage::new(w as u32 * 3, h as u32);
 
-    let to_u8 = |val: f32| ((val + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
-
-    for y in 0..h {
-        for x in 0..w {
-            let idx = y * w + x;
-
-            combined.put_pixel(x as u32, y as u32, Luma([to_u8(target_vec[idx])]));
-            combined.put_pixel(x as u32 + w as u32, y as u32, Luma([to_u8(input_vec[idx])]));
-            combined.put_pixel(
-                x as u32 + (w as u32 * 2),
-                y as u32,
-                Luma([to_u8(recon_vec[idx])]),
-            );
-        }
-    }
+    replace(&mut combined, &target_img, 0, 0);
+    replace(&mut combined, &input_img, w as i64, 0);
+    replace(&mut combined, &reconstruction_img, w as i64 * 2, 0);
 
     let path = format!("{ARTIFACT_DIR}/comparison_e{}_i{}.png", epoch, iter);
     if let Err(e) = combined.save(&path) {
@@ -117,7 +102,7 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     let optimizer_config = AdamConfig::new()
         .with_beta_1(0.0)
         .with_beta_2(0.9)
-        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+        // .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .with_weight_decay(None);
     let config = TrainingConfig::new(NetworkConfig::new(), optimizer_config);
 
@@ -137,7 +122,7 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
         .num_workers(2)
         .build(dataset);
 
-    for epoch in 0..config.num_epochs {
+    for epoch in 1..=config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
             let reconstructed = generator.forward(batch.edited.clone());
             let fake = reconstructed.clone().detach();

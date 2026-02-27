@@ -2,7 +2,8 @@
 images.bin
 /images
 /edited
-/artifact
-/artifact1
+/artifact*
+/reconstructed
+/test
 .cuda
 photo.jpg

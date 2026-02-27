@@ -1,7 +1,6 @@
 use burn::{
     config::Config,
-    module::Initializer,
-    module::Module,
+    module::{Initializer, Module},
     nn::{
         InstanceNorm, InstanceNormConfig, PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},

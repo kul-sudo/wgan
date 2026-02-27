@@ -7,13 +7,12 @@ use burn::{
         GaussianNoise, GaussianNoiseConfig, InstanceNorm, InstanceNormConfig, PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},
     },
-    prelude::ToElement,
     tensor::{
         Distribution, Tensor,
         activation::{leaky_relu, tanh},
         backend::Backend,
         linalg::{Norm, vector_normalize},
-        module::{attention, conv2d, interpolate},
+        module::{conv2d, interpolate},
         ops::{ConvOptions, InterpolateMode, InterpolateOptions},
     },
 };
@@ -50,7 +49,7 @@ fn spectral_norm<B: Backend>(
         .matmul(v_vec.clone().transpose())
         .detach();
 
-    let normalized_weight = weight.div(sigma.reshape([1, 1, 1, 1]).add_scalar(eps));
+    let normalized_weight = weight.div(sigma.reshape([1, 1, 1, 1]).add_scalar(1e-8));
 
     (normalized_weight, u_vec.detach(), v_vec.detach())
 }
@@ -103,10 +102,12 @@ impl<B: Backend> DiscriminatorBlock<B> {
         let u_current = self.u.value();
         let v_current = self.v.value();
 
-        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 1, 1e-8);
+        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 1, 1e-12);
 
-        self.u.update(u_next);
-        self.v.update(v_next);
+        if B::ad_enabled() {
+            self.u.update(u_next);
+            self.v.update(v_next);
+        }
 
         let x = conv2d(
             input,
@@ -179,11 +180,13 @@ impl<B: Backend> GeneratorConvBlock<B> {
             self.u.value(),
             self.v.value(),
             2,
-            1e-8,
+            1e-12,
         );
 
-        self.u.update(u_next);
-        self.v.update(v_next);
+        if B::ad_enabled() {
+            self.u.update(u_next);
+            self.v.update(v_next);
+        }
 
         let x = conv2d(
             input,
@@ -258,11 +261,13 @@ impl<B: Backend> GeneratorDeconvBlock<B> {
             self.u.value(),
             self.v.value(),
             2,
-            1e-8,
+            1e-12,
         );
 
-        self.u.update(u_next);
-        self.v.update(v_next);
+        if B::ad_enabled() {
+            self.u.update(u_next);
+            self.v.update(v_next);
+        }
 
         let x = conv2d(
             x,

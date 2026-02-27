@@ -1,6 +1,7 @@
 mod consts;
 mod dataset;
 mod files;
+mod inference;
 mod nets;
 mod network;
 mod training;
@@ -9,6 +10,7 @@ use burn::backend::{Autodiff, Cuda, cuda::CudaDevice};
 use std::env::var;
 // use wgan::{model::ModelConfig, training::TrainingConfig};
 use files::files_init;
+use inference::infer;
 use training::train;
 
 //
@@ -27,7 +29,7 @@ fn main() {
             train::<Autodiff<Cuda>>(&mut files, device);
         }
         "inference" => {
-            // infer_mode::<Cuda>(device);
+            infer::<Cuda>(&device);
         }
         _ => {
             std::process::exit(1);

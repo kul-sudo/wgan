@@ -15,11 +15,11 @@ const IMAGES_CACHE: &str = "images.bin";
 const INPUT_DIR: &str = "images";
 const OUTPUT_DIR: &str = "edited";
 
-const PIXEL_MAX: f32 = 255.0;
-const PIXEL_MID: f32 = PIXEL_MAX / 2.0;
+pub const PIXEL_MAX: f32 = 255.0;
+pub const PIXEL_MID: f32 = PIXEL_MAX / 2.0;
 const TARGET_WHITE: f32 = 253.0;
 
-fn norm(data: &[u8]) -> Vec<f32> {
+pub fn norm(data: &[u8]) -> Vec<f32> {
     data.iter().map(|&b| (b as f32 / PIXEL_MID) - 1.0).collect()
 }
 
