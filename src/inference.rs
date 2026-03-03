@@ -1,10 +1,11 @@
 use crate::consts::ARTIFACT_DIR;
+use crate::files::distort;
 use crate::files::{PIXEL_MID, norm};
 use crate::training::TrainingConfig;
 use burn::{
     config::Config,
     module::Module,
-    record::{CompactRecorder, Recorder},
+    record::CompactRecorder,
     tensor::{Tensor, TensorData, backend::Backend},
 };
 use image::{GrayImage, imageops::replace, open};
@@ -39,10 +40,18 @@ pub fn infer<B: Backend>(device: &B::Device) {
             continue;
         }
 
+        dbg!(&path);
+
+        let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap();
+        let is_original = file_name.ends_with("original");
+
         let img = open(&path).unwrap().to_luma8();
         let (w, h) = img.dimensions();
+
+        let processed_img = if is_original { distort(img) } else { img };
+
         let input_tensor = Tensor::<B, 4>::from_data(
-            TensorData::new(norm(img.as_raw()), [1, 1, h as usize, w as usize]),
+            TensorData::new(norm(processed_img.as_raw()), [1, 1, h as usize, w as usize]),
             device,
         );
 

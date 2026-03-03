@@ -1,4 +1,5 @@
-use image::{DynamicImage, open};
+use image::{DynamicImage, GrayImage, open};
+use rand::{RngExt, rng};
 use std::{
     fs::{create_dir_all, read, read_dir, write},
     path::Path,
@@ -17,10 +18,41 @@ const OUTPUT_DIR: &str = "edited";
 
 pub const PIXEL_MAX: f32 = 255.0;
 pub const PIXEL_MID: f32 = PIXEL_MAX / 2.0;
-const TARGET_WHITE: f32 = 253.0;
 
 pub fn norm(data: &[u8]) -> Vec<f32> {
     data.iter().map(|&b| (b as f32 / PIXEL_MID) - 1.0).collect()
+}
+
+pub fn distort(mut luma: GrayImage) -> GrayImage {
+    let mut r = rng();
+    let a = r.random_range(1.8..2.3);
+    let b = r.random_range(1.0..1.5);
+    let c = r.random_range(0.1..1.4);
+    let d = r.random_range(2.0..7.0);
+    let f = r.random_range(4.0..6.0);
+    let threshold = r.random_range(0.08..0.16);
+
+    for p in luma.pixels_mut() {
+        let l = p[0] as f32 / PIXEL_MAX;
+        let effect = if l < threshold {
+            a
+        } else {
+            (l * f).powf(b).max(1.0)
+        };
+
+        let val = l * effect;
+
+        p[0] = if val >= 0.99 {
+            255
+        } else {
+            (val * 255.0).min(255.0) as u8
+        };
+    }
+
+    DynamicImage::ImageLuma8(luma)
+        .blur(c)
+        .adjust_contrast(d)
+        .to_luma8()
 }
 
 pub fn files_init() -> Vec<ImagePair> {
@@ -38,29 +70,18 @@ pub fn files_init() -> Vec<ImagePair> {
             continue;
         }
 
-        let mut luma = open(&path).unwrap().to_luma8();
-        let original = norm(luma.as_raw());
+        let luma_original = open(&path).unwrap().to_luma8();
+        let original_vec = norm(luma_original.as_raw());
 
-        for p in luma.pixels_mut() {
-            let l = p[0] as f32 / PIXEL_MAX;
-            let effect = if l < 0.12 {
-                2.0
-            } else {
-                (l * 4.0).powf(1.1).max(1.0)
-            };
-            p[0] = (l * effect * TARGET_WHITE).min(TARGET_WHITE) as u8;
-        }
+        let luma_edited = distort(luma_original);
 
-        let final_img = DynamicImage::ImageLuma8(luma)
-            .blur(0.8)
-            .adjust_contrast(5.0);
-        final_img
+        luma_edited
             .save(Path::new(OUTPUT_DIR).join(path.file_name().unwrap()))
             .unwrap();
 
         files.push(ImagePair {
-            edited: norm(final_img.to_luma8().as_raw()),
-            original,
+            edited: norm(luma_edited.as_raw()),
+            original: original_vec,
         });
 
         println!("{:.2}%", (n + 1) as f32 / entries.len() as f32 * 100.0);

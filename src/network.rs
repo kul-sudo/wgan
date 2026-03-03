@@ -4,7 +4,7 @@ use burn::{
     config::Config,
     module::{Initializer, Module, RunningState},
     nn::{
-        GaussianNoise, GaussianNoiseConfig, InstanceNorm, InstanceNormConfig, PaddingConfig2d,
+        InstanceNorm, InstanceNormConfig, PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},
     },
     tensor::{
@@ -358,7 +358,6 @@ impl DiscriminatorConfig {
         let c = self.hidden_channels;
 
         Discriminator {
-            noise: GaussianNoiseConfig::new(0.2).init(),
             conv1: DiscriminatorBlockConfig::new(CHANNELS, c, 2).init(device),
             conv2: DiscriminatorBlockConfig::new(c, c * 2, 2).init(device),
             conv3: DiscriminatorBlockConfig::new(c * 2, c * 4, 2).init(device),
@@ -369,7 +368,6 @@ impl DiscriminatorConfig {
 
 #[derive(Module, Debug)]
 pub struct Discriminator<B: Backend> {
-    pub noise: GaussianNoise,
     pub conv1: DiscriminatorBlock<B>,
     pub conv2: DiscriminatorBlock<B>,
     pub conv3: DiscriminatorBlock<B>,
@@ -378,9 +376,7 @@ pub struct Discriminator<B: Backend> {
 
 impl<B: Backend> Discriminator<B> {
     pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 4> {
-        let x = self.noise.forward(images);
-
-        let x = self.conv1.forward(x, true);
+        let x = self.conv1.forward(images, true);
         let x = self.conv2.forward(x, true);
         let x = self.conv3.forward(x, true);
 
