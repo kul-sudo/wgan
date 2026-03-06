@@ -1,15 +1,14 @@
 mod consts;
+mod data;
 mod dataset;
-mod files;
 mod inference;
-mod nets;
 mod network;
 mod training;
 
 use burn::backend::{Autodiff, Cuda, cuda::CudaDevice};
 use std::env::var;
 // use wgan::{model::ModelConfig, training::TrainingConfig};
-use files::files_init;
+use data::files_init;
 use inference::infer;
 use training::train;
 

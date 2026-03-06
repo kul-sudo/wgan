@@ -1,6 +1,5 @@
 use crate::consts::ARTIFACT_DIR;
-use crate::files::distort;
-use crate::files::{PIXEL_MID, norm};
+use crate::data::{PIXEL_MID, distort, norm};
 use crate::training::TrainingConfig;
 use burn::{
     config::Config,
@@ -17,7 +16,7 @@ const RECONSTRUCTED_DIR: &str = "reconstructed";
 pub fn infer<B: Backend>(device: &B::Device) {
     let config =
         TrainingConfig::load(format!("{ARTIFACT_DIR}/config.json")).expect("Config not found");
-    let (generator, _, _) = config.model.init::<B>(device);
+    let (generator, _) = config.model.init::<B>(device);
 
     let latest_path = read_dir(ARTIFACT_DIR)
         .unwrap()

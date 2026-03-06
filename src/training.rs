@@ -1,6 +1,6 @@
 use crate::consts::ARTIFACT_DIR;
+use crate::data::{PIXEL_MID, RawImage};
 use crate::dataset::ImageBatcher;
-use crate::files::{ImagePair, PIXEL_MID};
 use crate::network::NetworkConfig;
 use burn::{
     config::Config,
@@ -22,42 +22,20 @@ pub struct TrainingConfig {
     pub optimizer: AdamConfig,
     #[config(default = 1000)]
     pub num_epochs: usize,
-    #[config(default = 8)]
+    #[config(default = 16)]
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
-    #[config(default = 4e-4)]
+    #[config(default = 2e-4)]
     pub discriminator_lr: f64,
     #[config(default = 1e-4)]
     pub generator_lr: f64,
-    #[config(default = 1)]
-    pub num_critic: usize,
-    #[config(default = 20.0)]
+    #[config(default = 8.0)]
     pub lambda_adv: f32,
-    #[config(default = 20.0)]
+    #[config(default = 2.0)]
     pub lambda_l1: f32,
-    #[config(default = 25.0)]
+    #[config(default = 10.0)]
     pub lambda_perceptual: f32,
-    #[config(default = 4.0)]
-    pub lambda_sobel: f32,
-}
-
-fn sobel<B: Backend>(x: Tensor<B, 4>, device: &B::Device) -> Tensor<B, 4> {
-    let opts = ConvOptions::new([1, 1], [1, 1], [1, 1], 1);
-
-    let gx = Tensor::<B, 4>::from_data(
-        [[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]],
-        device,
-    );
-    let gy = Tensor::<B, 4>::from_data(
-        [[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]],
-        device,
-    );
-
-    let x_edges = conv2d(x.clone(), gx, None, opts.clone());
-    let y_edges = conv2d(x, gy, None, opts);
-
-    (x_edges.powf_scalar(2.0) + y_edges.powf_scalar(2.0) + 1e-8).sqrt()
 }
 
 fn save_samples<B: Backend>(
@@ -96,7 +74,7 @@ fn save_samples<B: Backend>(
     }
 }
 
-pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
+pub fn train<B: AutodiffBackend>(items: &mut [RawImage], device: B::Device) {
     create_dir_all(ARTIFACT_DIR).unwrap();
 
     let optimizer_config = AdamConfig::new()
@@ -109,7 +87,7 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
     config.save(format!("{ARTIFACT_DIR}/config.json")).unwrap();
     B::seed(&device, config.seed);
 
-    let (mut generator, mut discriminator, perceptual_net) = config.model.init::<B>(&device);
+    let (mut generator, mut discriminator) = config.model.init::<B>(&device);
     let mut optimizer_g = config.optimizer.init();
     let mut optimizer_d = config.optimizer.init();
 
@@ -124,51 +102,51 @@ pub fn train<B: AutodiffBackend>(items: &mut [ImagePair], device: B::Device) {
 
     for epoch in 1..=config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
+            let fake = generator.forward(batch.edited.clone()).detach();
+            let score_fake = discriminator.forward(fake.clone());
+            let score_real = discriminator.forward(batch.original.clone());
+
+            let loss_d: Tensor<B, 1> =
+                relu(1.0 + score_fake).mean() + relu(1.0 - score_real).mean();
+
+            println!("Loss D: {}", loss_d.clone().into_scalar().to_f32());
+
+            let grads = loss_d.backward();
+            let grads = GradientsParams::from_grads(grads, &discriminator);
+            discriminator = optimizer_d.step(config.discriminator_lr, discriminator, grads);
+
             let reconstructed = generator.forward(batch.edited.clone());
-            let fake = reconstructed.clone().detach();
 
-            for _ in 0..config.num_critic {
-                let score_fake = discriminator.forward(fake.clone());
-                let score_real = discriminator.forward(batch.original.clone());
+            let (score_reconstructed, feat_fake) =
+                discriminator.forward_with_features(reconstructed.clone());
+            let (_, feat_real) = discriminator.forward_with_features(batch.original.clone());
 
-                let loss_d = relu(1.0 + score_fake).mean() + relu(1.0 - score_real).mean();
-
-                let grads = loss_d.backward();
-                let grads = GradientsParams::from_grads(grads, &discriminator);
-                discriminator = optimizer_d.step(config.discriminator_lr, discriminator, grads);
-            }
-
-            let score_reconstructed = discriminator.forward(reconstructed.clone());
+            // Adv Loss
             let loss_adv = -score_reconstructed.mean();
 
+            // L1 Loss
             let loss_l1 = (reconstructed.clone() - batch.original.clone())
                 .abs()
                 .mean();
 
-            let (f_real1, f_real2, f_real3) = perceptual_net.forward(batch.original.clone());
-            let (f_fake1, f_fake2, f_fake3) = perceptual_net.forward(reconstructed.clone());
+            // Perceptual
+            let mut loss_fm = Tensor::from_data([0.0], &device);
+            for (f_f, f_r) in feat_fake.into_iter().zip(feat_real.into_iter()) {
+                loss_fm = loss_fm + (f_f - f_r.detach()).abs().mean();
+            }
 
-            let loss_perceptual = (f_fake1 - f_real1.detach()).abs().mean()
-                + (f_fake2 - f_real2.detach()).abs().mean()
-                + (f_fake3 - f_real3.detach()).abs().mean();
-
-            let edges_real = sobel(batch.original.clone(), &device);
-            let edges_fake = sobel(reconstructed.clone(), &device);
-            let loss_sobel = (edges_fake - edges_real).abs().mean();
-
+            // Total G Loss
             let loss_g = (loss_adv.clone() * config.lambda_adv)
                 + (loss_l1.clone() * config.lambda_l1)
-                + (loss_perceptual.clone() * config.lambda_perceptual)
-                + (loss_sobel.clone() * config.lambda_sobel);
+                + (loss_fm.clone() * config.lambda_perceptual);
 
             if iteration % 10 == 0 {
                 println!(
-                    "Epoch: {} Adv: {:.2} L1: {:.2} Perceptual: {:.2} Sobel: {:.2} Total G: {:.4}",
+                    "Epoch: {} Adv: {:.2} L1: {:.2} FeatMatch: {:.2} Total G: {:.4}",
                     epoch,
                     (loss_adv.clone().into_scalar().to_f32() * config.lambda_adv),
                     (loss_l1.clone().into_scalar().to_f32() * config.lambda_l1),
-                    (loss_perceptual.clone().into_scalar().to_f32() * config.lambda_perceptual),
-                    (loss_sobel.clone().into_scalar().to_f32() * config.lambda_sobel),
+                    (loss_fm.clone().into_scalar().to_f32() * config.lambda_perceptual),
                     loss_g.clone().into_scalar().to_f32()
                 );
             }
