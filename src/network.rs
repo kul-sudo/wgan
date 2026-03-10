@@ -9,13 +9,14 @@ use burn::{
     },
     tensor::{
         Distribution, Tensor,
-        activation::{leaky_relu, tanh},
+        activation::{leaky_relu, mish, tanh},
         backend::Backend,
         linalg::{Norm, vector_normalize},
         module::conv2d,
         ops::ConvOptions,
     },
 };
+use std::f64::consts::SQRT_2;
 
 const NEGATIVE_SLOPE: f64 = 0.2;
 
@@ -46,10 +47,10 @@ fn spectral_norm<B: Backend>(
     let sigma = u_vec
         .clone()
         .matmul(weight_mat)
-        .matmul(v_vec.clone().transpose())
-        .detach();
+        .matmul(v_vec.clone().transpose());
 
-    let normalized_weight = weight.div(sigma.reshape([1, 1, 1, 1]).add_scalar(1e-8));
+    let sigma_val = sigma.reshape([1, 1, 1, 1]).abs();
+    let normalized_weight = weight.div(sigma_val.add_scalar(1e-8));
 
     (normalized_weight, u_vec.detach(), v_vec.detach())
 }
@@ -58,7 +59,7 @@ fn spectral_norm<B: Backend>(
 #[derive(Module, Debug)]
 pub struct GeneratorConvBlock<B: Backend> {
     conv: Conv2d<B>,
-    norm: InstanceNorm<B>,
+    norm: Option<InstanceNorm<B>>,
 }
 
 #[derive(Config, Debug)]
@@ -69,20 +70,18 @@ pub struct GeneratorConvBlockConfig {
 }
 
 impl GeneratorConvBlockConfig {
-    fn init<B: Backend>(&self, device: &B::Device) -> GeneratorConvBlock<B> {
-        let leaky_gain = (2.0 / (1.0 + NEGATIVE_SLOPE.powi(2))).sqrt();
-
+    fn init<B: Backend>(&self, use_norm: bool, device: &B::Device) -> GeneratorConvBlock<B> {
         GeneratorConvBlock {
             conv: Conv2dConfig::new([self.in_channels, self.out_channels], [4, 4])
                 .with_stride([self.stride, self.stride])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
-                .with_bias(false) // before InstanceNorm
+                .with_bias(!use_norm)
                 .with_initializer(Initializer::KaimingNormal {
-                    gain: leaky_gain,
+                    gain: SQRT_2,
                     fan_out_only: false,
                 })
                 .init(device),
-            norm: InstanceNormConfig::new(self.out_channels).init(device),
+            norm: use_norm.then(|| InstanceNormConfig::new(self.out_channels).init(device)),
         }
     }
 }
@@ -90,15 +89,18 @@ impl GeneratorConvBlockConfig {
 impl<B: Backend> GeneratorConvBlock<B> {
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv.forward(input);
-        let x = self.norm.forward(x);
-        leaky_relu(x, NEGATIVE_SLOPE)
+        let x = match &self.norm {
+            Some(n) => n.forward(x),
+            None => x,
+        };
+        mish(x)
     }
 }
 
 #[derive(Module, Debug)]
 pub struct GeneratorDeconvBlock<B: Backend> {
     deconv: ConvTranspose2d<B>,
-    norm: InstanceNorm<B>,
+    norm: Option<InstanceNorm<B>>,
 }
 
 #[derive(Config, Debug)]
@@ -108,20 +110,18 @@ pub struct GeneratorDeconvBlockConfig {
 }
 
 impl GeneratorDeconvBlockConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> GeneratorDeconvBlock<B> {
-        let leaky_gain = (2.0 / (1.0 + NEGATIVE_SLOPE.powi(2))).sqrt();
-
+    pub fn init<B: Backend>(&self, use_norm: bool, device: &B::Device) -> GeneratorDeconvBlock<B> {
         GeneratorDeconvBlock {
             deconv: ConvTranspose2dConfig::new([self.in_channels, self.out_channels], [4, 4])
                 .with_stride([2, 2])
                 .with_padding([1, 1])
-                .with_bias(false)
+                .with_bias(!use_norm)
                 .with_initializer(Initializer::KaimingNormal {
-                    gain: leaky_gain,
+                    gain: SQRT_2,
                     fan_out_only: false,
                 })
                 .init(device),
-            norm: InstanceNormConfig::new(self.out_channels).init(device),
+            norm: use_norm.then(|| InstanceNormConfig::new(self.out_channels).init(device)),
         }
     }
 }
@@ -129,8 +129,11 @@ impl GeneratorDeconvBlockConfig {
 impl<B: Backend> GeneratorDeconvBlock<B> {
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.deconv.forward(input);
-        let x = self.norm.forward(x);
-        leaky_relu(x, NEGATIVE_SLOPE)
+        let x = match &self.norm {
+            Some(n) => n.forward(x),
+            None => x,
+        };
+        mish(x)
     }
 }
 
@@ -141,6 +144,7 @@ pub struct ResBlock<B: Backend> {
     conv2: Conv2d<B>,
     norm1: InstanceNorm<B>,
     norm2: InstanceNorm<B>,
+    dropout: Dropout,
 }
 
 #[derive(Config, Debug)]
@@ -150,14 +154,12 @@ pub struct ResBlockConfig {
 
 impl ResBlockConfig {
     fn init<B: Backend>(&self, device: &B::Device) -> ResBlock<B> {
-        let leaky_gain = (2.0 / (1.0 + NEGATIVE_SLOPE.powi(2))).sqrt();
-
         ResBlock {
             conv1: Conv2dConfig::new([self.channels, self.channels], [3, 3])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_bias(false)
                 .with_initializer(Initializer::KaimingNormal {
-                    gain: leaky_gain,
+                    gain: SQRT_2,
                     fan_out_only: false,
                 })
                 .init(device),
@@ -166,11 +168,12 @@ impl ResBlockConfig {
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_bias(false)
                 .with_initializer(Initializer::KaimingNormal {
-                    gain: leaky_gain,
+                    gain: SQRT_2,
                     fan_out_only: false,
                 })
                 .init(device),
             norm2: InstanceNormConfig::new(self.channels).init(device),
+            dropout: DropoutConfig::new(0.5).init(),
         }
     }
 }
@@ -179,7 +182,9 @@ impl<B: Backend> ResBlock<B> {
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv1.forward(input.clone());
         let x = self.norm1.forward(x);
-        let x = leaky_relu(x, NEGATIVE_SLOPE);
+        let x = mish(x);
+
+        let x = self.dropout.forward(x);
 
         let x = self.conv2.forward(x);
         let x = self.norm2.forward(x);
@@ -194,9 +199,7 @@ pub struct Generator<B: Backend> {
     pub enc2: GeneratorConvBlock<B>,
     pub enc3: GeneratorConvBlock<B>,
     pub enc4: GeneratorConvBlock<B>,
-    pub res1: ResBlock<B>,
-    pub res2: ResBlock<B>,
-    pub res3: ResBlock<B>,
+    pub res_blocks: Vec<ResBlock<B>>,
     pub dec4: GeneratorDeconvBlock<B>,
     pub dec3: GeneratorDeconvBlock<B>,
     pub dec2: GeneratorDeconvBlock<B>,
@@ -207,6 +210,8 @@ pub struct Generator<B: Backend> {
 #[derive(Config, Debug)]
 pub struct GeneratorConfig {
     hidden_channels: usize,
+    #[config(default = 9)]
+    res_blocks: usize,
 }
 
 impl GeneratorConfig {
@@ -214,17 +219,17 @@ impl GeneratorConfig {
         let c = self.hidden_channels;
 
         Generator {
-            enc1: GeneratorConvBlockConfig::new(CHANNELS, c, 2).init(device),
-            enc2: GeneratorConvBlockConfig::new(c, c * 2, 2).init(device),
-            enc3: GeneratorConvBlockConfig::new(c * 2, c * 4, 2).init(device),
-            enc4: GeneratorConvBlockConfig::new(c * 4, c * 8, 2).init(device),
-            res1: ResBlockConfig::new(c * 8).init(device),
-            res2: ResBlockConfig::new(c * 8).init(device),
-            res3: ResBlockConfig::new(c * 8).init(device),
-            dec4: GeneratorDeconvBlockConfig::new(c * 8, c * 4).init(device),
-            dec3: GeneratorDeconvBlockConfig::new(c * 4, c * 2).init(device),
-            dec2: GeneratorDeconvBlockConfig::new(c * 2, c).init(device),
-            dec1: GeneratorDeconvBlockConfig::new(c, c).init(device),
+            enc1: GeneratorConvBlockConfig::new(CHANNELS, c, 2).init(false, device),
+            enc2: GeneratorConvBlockConfig::new(c, c * 2, 2).init(true, device),
+            enc3: GeneratorConvBlockConfig::new(c * 2, c * 4, 2).init(true, device),
+            enc4: GeneratorConvBlockConfig::new(c * 4, c * 8, 2).init(true, device),
+            res_blocks: (0..self.res_blocks)
+                .map(|_| ResBlockConfig::new(c * 8).init(device))
+                .collect(),
+            dec4: GeneratorDeconvBlockConfig::new(c * 16, c * 4).init(true, device),
+            dec3: GeneratorDeconvBlockConfig::new(c * 4, c * 2).init(true, device),
+            dec2: GeneratorDeconvBlockConfig::new(c * 2, c * 2).init(true, device),
+            dec1: GeneratorDeconvBlockConfig::new(c * 2, c).init(false, device),
             final_conv: Conv2dConfig::new([c, CHANNELS], [3, 3])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_bias(true)
@@ -236,21 +241,26 @@ impl GeneratorConfig {
 
 impl<B: Backend> Generator<B> {
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
-        let x = self.enc1.forward(input);
-        let x = self.enc2.forward(x);
-        let x = self.enc3.forward(x);
-        let x = self.enc4.forward(x);
+        let s1 = self.enc1.forward(input);
+        let s2 = self.enc2.forward(s1);
+        let s3 = self.enc3.forward(s2);
+        let s4 = self.enc4.forward(s3.clone());
 
-        let x = self.res1.forward(x);
-        let x = self.res2.forward(x);
-        let x = self.res3.forward(x);
+        let mut x = s4.clone();
 
+        for block in &self.res_blocks {
+            x = block.forward(x);
+        }
+
+        let x = Tensor::cat(vec![x, s4], 1);
         let x = self.dec4.forward(x);
+
         let x = self.dec3.forward(x);
         let x = self.dec2.forward(x);
         let x = self.dec1.forward(x);
 
         let x = self.final_conv.forward(x);
+
         tanh(x)
     }
 }
@@ -290,7 +300,7 @@ impl DiscriminatorBlockConfig {
                 device,
             )),
             v: RunningState::new(Tensor::<B, 2>::random(
-                [1, self.in_channels * 4 * 4],
+                [1, self.in_channels * 4_usize.pow(2)],
                 Distribution::Normal(0.0, 1.0),
                 device,
             )),
@@ -299,12 +309,12 @@ impl DiscriminatorBlockConfig {
 }
 
 impl<B: Backend> DiscriminatorBlock<B> {
-    pub fn forward(&self, input: Tensor<B, 4>, activation: bool) -> Tensor<B, 4> {
+    pub fn forward(&self, input: Tensor<B, 4>, use_activation: bool) -> Tensor<B, 4> {
         let weight = self.conv.weight.val();
         let u_current = self.u.value();
         let v_current = self.v.value();
 
-        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 1, 1e-12);
+        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 2, 1e-12);
 
         if B::ad_enabled() {
             self.u.update(u_next);
@@ -323,7 +333,7 @@ impl<B: Backend> DiscriminatorBlock<B> {
             ),
         );
 
-        if activation {
+        if use_activation {
             leaky_relu(x, NEGATIVE_SLOPE)
         } else {
             x
@@ -341,12 +351,11 @@ impl DiscriminatorConfig {
         let c = self.hidden_channels;
 
         Discriminator {
-            noise: GaussianNoiseConfig::new(0.2).init(),
+            noise: GaussianNoiseConfig::new(0.1).init(),
             block1: DiscriminatorBlockConfig::new(CHANNELS, c, 2).init(device),
             block2: DiscriminatorBlockConfig::new(c, c * 2, 2).init(device),
             block3: DiscriminatorBlockConfig::new(c * 2, c * 4, 2).init(device),
             block4: DiscriminatorBlockConfig::new(c * 4, c * 8, 2).init(device),
-            block5: DiscriminatorBlockConfig::new(c * 8, c * 8, 1).init(device),
             final_block: DiscriminatorBlockConfig::new(c * 8, 1, 1).init(device),
         }
     }
@@ -359,7 +368,6 @@ pub struct Discriminator<B: Backend> {
     pub block2: DiscriminatorBlock<B>,
     pub block3: DiscriminatorBlock<B>,
     pub block4: DiscriminatorBlock<B>,
-    pub block5: DiscriminatorBlock<B>,
     pub final_block: DiscriminatorBlock<B>,
 }
 
@@ -371,7 +379,6 @@ impl<B: Backend> Discriminator<B> {
         let x = self.block2.forward(x, true);
         let x = self.block3.forward(x, true);
         let x = self.block4.forward(x, true);
-        let x = self.block5.forward(x, true);
 
         self.final_block.forward(x, false)
     }
@@ -390,9 +397,6 @@ impl<B: Backend> Discriminator<B> {
         features.push(x.clone());
 
         let x = self.block4.forward(x, true);
-        features.push(x.clone());
-
-        let x = self.block5.forward(x, true);
         features.push(x.clone());
 
         let out = self.final_block.forward(x, false);

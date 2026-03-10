@@ -22,19 +22,19 @@ pub struct TrainingConfig {
     pub optimizer: AdamConfig,
     #[config(default = 1000)]
     pub num_epochs: usize,
-    #[config(default = 16)]
+    #[config(default = 8)]
     pub batch_size: usize,
     #[config(default = 5)]
     pub seed: u64,
-    #[config(default = 2e-4)]
+    #[config(default = 4e-4)]
     pub discriminator_lr: f64,
     #[config(default = 1e-4)]
     pub generator_lr: f64,
-    #[config(default = 8.0)]
+    #[config(default = 20.0)]
     pub lambda_adv: f32,
-    #[config(default = 2.0)]
+    #[config(default = 0.0)]
     pub lambda_l1: f32,
-    #[config(default = 10.0)]
+    #[config(default = 2.0)]
     pub lambda_perceptual: f32,
 }
 
@@ -103,13 +103,19 @@ pub fn train<B: AutodiffBackend>(items: &mut [RawImage], device: B::Device) {
     for epoch in 1..=config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
             let fake = generator.forward(batch.edited.clone()).detach();
-            let score_fake = discriminator.forward(fake.clone());
+
+            let score_fake = discriminator.forward(fake);
             let score_real = discriminator.forward(batch.original.clone());
 
+            dbg!(
+                score_fake.clone().mean().into_scalar().to_f32(),
+                score_real.clone().mean().into_scalar().to_f32()
+            );
             let loss_d: Tensor<B, 1> =
                 relu(1.0 + score_fake).mean() + relu(1.0 - score_real).mean();
 
-            println!("Loss D: {}", loss_d.clone().into_scalar().to_f32());
+            let loss_d_scalar: f32 = loss_d.clone().into_scalar().to_f32();
+            println!("Loss D: {}", loss_d_scalar);
 
             let grads = loss_d.backward();
             let grads = GradientsParams::from_grads(grads, &discriminator);
@@ -130,15 +136,15 @@ pub fn train<B: AutodiffBackend>(items: &mut [RawImage], device: B::Device) {
                 .mean();
 
             // Perceptual
-            let mut loss_fm = Tensor::from_data([0.0], &device);
+            let mut loss_perceptual = Tensor::from_data([0.0], &device);
             for (f_f, f_r) in feat_fake.into_iter().zip(feat_real.into_iter()) {
-                loss_fm = loss_fm + (f_f - f_r.detach()).abs().mean();
+                loss_perceptual = loss_perceptual + (f_f - f_r.detach()).abs().mean();
             }
 
             // Total G Loss
             let loss_g = (loss_adv.clone() * config.lambda_adv)
                 + (loss_l1.clone() * config.lambda_l1)
-                + (loss_fm.clone() * config.lambda_perceptual);
+                + (loss_perceptual.clone() * config.lambda_perceptual);
 
             if iteration % 10 == 0 {
                 println!(
@@ -146,7 +152,7 @@ pub fn train<B: AutodiffBackend>(items: &mut [RawImage], device: B::Device) {
                     epoch,
                     (loss_adv.clone().into_scalar().to_f32() * config.lambda_adv),
                     (loss_l1.clone().into_scalar().to_f32() * config.lambda_l1),
-                    (loss_fm.clone().into_scalar().to_f32() * config.lambda_perceptual),
+                    (loss_perceptual.clone().into_scalar().to_f32() * config.lambda_perceptual),
                     loss_g.clone().into_scalar().to_f32()
                 );
             }
