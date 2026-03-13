@@ -1,4 +1,4 @@
-use crate::consts::ARTIFACT_DIR;
+use crate::consts::{ARTIFACT_DIR, CHANNELS};
 use crate::data::{PIXEL_MID, distort, norm};
 use crate::training::TrainingConfig;
 use burn::{
@@ -49,10 +49,16 @@ pub fn infer<B: Backend>(device: &B::Device) {
 
         let processed_img = if is_original { distort(img) } else { img };
 
-        let input_tensor = Tensor::<B, 4>::from_data(
-            TensorData::new(norm(processed_img.as_raw()), [1, 1, h as usize, w as usize]),
+        let input_tensor = Tensor::<B, 3>::from_data(
+            TensorData::new(
+                norm(processed_img.as_raw()),
+                [h as usize, w as usize, CHANNELS],
+            )
+            .convert::<B::FloatElem>(),
             device,
-        );
+        )
+        .permute([2, 0, 1])
+        .unsqueeze_dim::<4>(0);
 
         let reconstructed = generator.forward(input_tensor.clone());
         save_sample::<B>(idx, input_tensor, reconstructed);

@@ -18,13 +18,12 @@ use training::train;
 // }
 
 fn main() {
-    let mut files = files_init();
-
     let device = CudaDevice::default();
     let mode = var("MODE").unwrap_or_else(|_| panic!("No MODE specified."));
 
     match mode.to_lowercase().as_str() {
         "training" => {
+            let mut files = files_init();
             train::<Autodiff<Cuda>>(&mut files, device);
         }
         "inference" => {

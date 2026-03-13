@@ -24,17 +24,19 @@ pub struct TrainingConfig {
     pub num_epochs: usize,
     #[config(default = 8)]
     pub batch_size: usize,
+    #[config(default = 0.1)]
+    pub label_smoothing: f32,
     #[config(default = 5)]
     pub seed: u64,
     #[config(default = 4e-4)]
     pub discriminator_lr: f64,
     #[config(default = 1e-4)]
     pub generator_lr: f64,
-    #[config(default = 20.0)]
+    #[config(default = 5.0)]
     pub lambda_adv: f32,
     #[config(default = 0.0)]
     pub lambda_l1: f32,
-    #[config(default = 2.0)]
+    #[config(default = 10.0)]
     pub lambda_perceptual: f32,
 }
 
@@ -111,8 +113,8 @@ pub fn train<B: AutodiffBackend>(items: &mut [RawImage], device: B::Device) {
                 score_fake.clone().mean().into_scalar().to_f32(),
                 score_real.clone().mean().into_scalar().to_f32()
             );
-            let loss_d: Tensor<B, 1> =
-                relu(1.0 + score_fake).mean() + relu(1.0 - score_real).mean();
+            let loss_d: Tensor<B, 1> = relu(1.0 + score_fake).mean()
+                + relu(1.0 - config.label_smoothing - score_real).mean();
 
             let loss_d_scalar: f32 = loss_d.clone().into_scalar().to_f32();
             println!("Loss D: {}", loss_d_scalar);

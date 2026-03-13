@@ -41,6 +41,11 @@ impl<B: Backend> Batcher<B, RawImage, ImageBatch<B>> for ImageBatcher {
                     o = o.flip([2]);
                 }
 
+                if rng().random_bool(0.01) {
+                    e = e.flip([1]);
+                    o = o.flip([1]);
+                }
+
                 (e, o)
             })
             .unzip();

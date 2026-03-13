@@ -199,6 +199,7 @@ pub struct Generator<B: Backend> {
     pub enc2: GeneratorConvBlock<B>,
     pub enc3: GeneratorConvBlock<B>,
     pub enc4: GeneratorConvBlock<B>,
+    pub noise: GaussianNoise,
     pub res_blocks: Vec<ResBlock<B>>,
     pub dec4: GeneratorDeconvBlock<B>,
     pub dec3: GeneratorDeconvBlock<B>,
@@ -223,6 +224,7 @@ impl GeneratorConfig {
             enc2: GeneratorConvBlockConfig::new(c, c * 2, 2).init(true, device),
             enc3: GeneratorConvBlockConfig::new(c * 2, c * 4, 2).init(true, device),
             enc4: GeneratorConvBlockConfig::new(c * 4, c * 8, 2).init(true, device),
+            noise: GaussianNoiseConfig::new(0.05).init(),
             res_blocks: (0..self.res_blocks)
                 .map(|_| ResBlockConfig::new(c * 8).init(device))
                 .collect(),
@@ -246,21 +248,23 @@ impl<B: Backend> Generator<B> {
         let s3 = self.enc3.forward(s2);
         let s4 = self.enc4.forward(s3.clone());
 
-        let mut x = s4.clone();
+        let latent_noisy = self.noise.forward(s4.clone());
 
+        let mut x = latent_noisy.clone();
         for block in &self.res_blocks {
             x = block.forward(x);
         }
 
-        let x = Tensor::cat(vec![x, s4], 1);
-        let x = self.dec4.forward(x);
+        let skip_noisy = self.noise.forward(s4);
 
+        let x = Tensor::cat(vec![x, skip_noisy], 1);
+
+        let x = self.dec4.forward(x);
         let x = self.dec3.forward(x);
         let x = self.dec2.forward(x);
         let x = self.dec1.forward(x);
 
         let x = self.final_conv.forward(x);
-
         tanh(x)
     }
 }
@@ -282,16 +286,14 @@ pub struct DiscriminatorBlockConfig {
 
 impl DiscriminatorBlockConfig {
     fn init<B: Backend>(&self, device: &B::Device) -> DiscriminatorBlock<B> {
-        let leaky_gain = (2.0 / (1.0 + NEGATIVE_SLOPE.powi(2))).sqrt();
-
         DiscriminatorBlock {
             conv: Conv2dConfig::new([self.in_channels, self.out_channels], [4, 4])
                 .with_stride([self.stride, self.stride])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .with_bias(true)
-                .with_initializer(Initializer::KaimingNormal {
-                    gain: leaky_gain,
-                    fan_out_only: false,
+                .with_initializer(Initializer::Normal {
+                    mean: 0.0,
+                    std: 0.02,
                 })
                 .init(device),
             u: RunningState::new(Tensor::<B, 2>::random(
@@ -314,7 +316,7 @@ impl<B: Backend> DiscriminatorBlock<B> {
         let u_current = self.u.value();
         let v_current = self.v.value();
 
-        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 2, 1e-12);
+        let (sn_weight, u_next, v_next) = spectral_norm(weight, u_current, v_current, 1, 1e-12);
 
         if B::ad_enabled() {
             self.u.update(u_next);
@@ -351,7 +353,7 @@ impl DiscriminatorConfig {
         let c = self.hidden_channels;
 
         Discriminator {
-            noise: GaussianNoiseConfig::new(0.1).init(),
+            noise: GaussianNoiseConfig::new(0.05).init(),
             block1: DiscriminatorBlockConfig::new(CHANNELS, c, 2).init(device),
             block2: DiscriminatorBlockConfig::new(c, c * 2, 2).init(device),
             block3: DiscriminatorBlockConfig::new(c * 2, c * 4, 2).init(device),
