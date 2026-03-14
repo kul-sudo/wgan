@@ -23,11 +23,11 @@ pub fn norm(data: &[u8]) -> Vec<f32> {
 pub fn distort(mut luma: GrayImage) -> GrayImage {
     let mut r = rng();
     let a = r.random_range(1.0..3.0);
-    let b = r.random_range(0.5..2.0);
+    let b = r.random_range(0.0..4.0);
     let c = r.random_range(0.0..2.0);
     let d = r.random_range(1.0..8.0);
     let f = r.random_range(1.0..9.0);
-    let k = r.random_range(0.96..0.99);
+    let k = r.random_range(0.94..0.99);
     let threshold = r.random_range(0.08..0.16);
 
     for p in luma.pixels_mut() {

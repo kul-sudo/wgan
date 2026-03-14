@@ -224,7 +224,7 @@ impl GeneratorConfig {
             enc2: GeneratorConvBlockConfig::new(c, c * 2, 2).init(true, device),
             enc3: GeneratorConvBlockConfig::new(c * 2, c * 4, 2).init(true, device),
             enc4: GeneratorConvBlockConfig::new(c * 4, c * 8, 2).init(true, device),
-            noise: GaussianNoiseConfig::new(0.05).init(),
+            noise: GaussianNoiseConfig::new(0.1).init(),
             res_blocks: (0..self.res_blocks)
                 .map(|_| ResBlockConfig::new(c * 8).init(device))
                 .collect(),
@@ -353,7 +353,7 @@ impl DiscriminatorConfig {
         let c = self.hidden_channels;
 
         Discriminator {
-            noise: GaussianNoiseConfig::new(0.05).init(),
+            noise: GaussianNoiseConfig::new(0.01).init(),
             block1: DiscriminatorBlockConfig::new(CHANNELS, c, 2).init(device),
             block2: DiscriminatorBlockConfig::new(c, c * 2, 2).init(device),
             block3: DiscriminatorBlockConfig::new(c * 2, c * 4, 2).init(device),
