@@ -4,6 +4,7 @@ images.bin
 /edited
 /artifact*
 /reconstructed
+/reconstructed1
 /test
 .cuda
 photo.jpg

@@ -246,17 +246,16 @@ impl<B: Backend> Generator<B> {
         let s1 = self.enc1.forward(input);
         let s2 = self.enc2.forward(s1);
         let s3 = self.enc3.forward(s2);
-        let s4 = self.enc4.forward(s3.clone());
+        let s4 = self.enc4.forward(s3);
 
-        let latent_noisy = self.noise.forward(s4.clone());
-
-        let mut x = latent_noisy.clone();
-        for block in &self.res_blocks {
-            x = block.forward(x);
-        }
+        let x = self
+            .res_blocks
+            .iter()
+            .fold(self.noise.forward(s4.clone()), |acc, block| {
+                block.forward(acc)
+            });
 
         let skip_noisy = self.noise.forward(s4);
-
         let x = Tensor::cat(vec![x, skip_noisy], 1);
 
         let x = self.dec4.forward(x);
@@ -264,8 +263,7 @@ impl<B: Backend> Generator<B> {
         let x = self.dec2.forward(x);
         let x = self.dec1.forward(x);
 
-        let x = self.final_conv.forward(x);
-        tanh(x)
+        tanh(self.final_conv.forward(x))
     }
 }
 

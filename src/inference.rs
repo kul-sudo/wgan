@@ -39,13 +39,26 @@ pub fn infer<B: Backend>(device: &B::Device) {
             continue;
         }
 
-        dbg!(&path);
-
         let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap();
         let is_original = file_name.ends_with("original");
 
         let img = open(&path).unwrap().to_luma8();
         let (w, h) = img.dimensions();
+
+        // Only create original_tensor if we are actually going to distort it
+        let original_tensor = if is_original {
+            Some(
+                Tensor::<B, 3>::from_data(
+                    TensorData::new(norm(img.as_raw()), [h as usize, w as usize, CHANNELS])
+                        .convert::<B::FloatElem>(),
+                    device,
+                )
+                .permute([2, 0, 1])
+                .unsqueeze_dim::<4>(0),
+            )
+        } else {
+            None
+        };
 
         let processed_img = if is_original { distort(img) } else { img };
 
@@ -61,11 +74,17 @@ pub fn infer<B: Backend>(device: &B::Device) {
         .unsqueeze_dim::<4>(0);
 
         let reconstructed = generator.forward(input_tensor.clone());
-        save_sample::<B>(idx, input_tensor, reconstructed);
+
+        save_sample::<B>(idx, input_tensor, original_tensor, reconstructed);
     }
 }
 
-fn save_sample<B: Backend>(iter: usize, input: Tensor<B, 4>, recon: Tensor<B, 4>) {
+fn save_sample<B: Backend>(
+    iter: usize,
+    input: Tensor<B, 4>,
+    original: Option<Tensor<B, 4>>, // Now an Option
+    recon: Tensor<B, 4>,
+) {
     let [_, _, h, w] = input.dims();
     let denorm = |t: Tensor<B, 4>| -> Vec<u8> {
         t.slice([0..1, 0..1])
@@ -77,14 +96,32 @@ fn save_sample<B: Backend>(iter: usize, input: Tensor<B, 4>, recon: Tensor<B, 4>
             .collect()
     };
 
-    let mut combined = GrayImage::new(w as u32 * 2, h as u32);
-    let img_in = GrayImage::from_raw(w as u32, h as u32, denorm(input)).unwrap();
-    let img_out = GrayImage::from_raw(w as u32, h as u32, denorm(recon)).unwrap();
+    let img_distorted = GrayImage::from_raw(w as u32, h as u32, denorm(input)).unwrap();
+    let img_recon = GrayImage::from_raw(w as u32, h as u32, denorm(recon)).unwrap();
 
-    replace(&mut combined, &img_in, 0, 0);
-    replace(&mut combined, &img_out, w as i64, 0);
+    match original {
+        Some(orig_tensor) => {
+            let mut combined = GrayImage::new(w as u32 * 3, h as u32);
+            let img_original =
+                GrayImage::from_raw(w as u32, h as u32, denorm(orig_tensor)).unwrap();
 
-    combined
-        .save(format!("{RECONSTRUCTED_DIR}/output_{iter}.png"))
-        .unwrap();
+            replace(&mut combined, &img_distorted, 0, 0);
+            replace(&mut combined, &img_original, w as i64, 0);
+            replace(&mut combined, &img_recon, (w * 2) as i64, 0);
+
+            combined
+                .save(format!("{RECONSTRUCTED_DIR}/output_{iter}.png"))
+                .unwrap();
+        }
+        None => {
+            let mut combined = GrayImage::new(w as u32 * 2, h as u32);
+
+            replace(&mut combined, &img_distorted, 0, 0);
+            replace(&mut combined, &img_recon, w as i64, 0);
+
+            combined
+                .save(format!("{RECONSTRUCTED_DIR}/output_{iter}.png"))
+                .unwrap();
+        }
+    }
 }

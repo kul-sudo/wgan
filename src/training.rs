@@ -9,9 +9,7 @@ use burn::{
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
-    tensor::{
-        Tensor, activation::relu, backend::AutodiffBackend, module::conv2d, ops::ConvOptions,
-    },
+    tensor::{Tensor, activation::relu, backend::AutodiffBackend},
 };
 use image::{GrayImage, imageops::replace};
 use std::fs::create_dir_all;
